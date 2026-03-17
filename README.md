@@ -22,6 +22,7 @@ Think of it as **digital tracing paper** for your monitor.
 - **Adjustable Opacity** — Slider from 5% to 100%
 - **Resizable Overlay** — Drag edges or set exact pixel dimensions
 - **Always on Top** — Overlay stays above all other windows
+- **Keyboard Shortcuts** — Control everything without leaving your drawing app
 - **Lightweight** — Single Python file, minimal dependencies
 
 ## Quick Start
@@ -50,20 +51,31 @@ The executable will be in the `dist/` folder.
 ## How to Use
 
 1. **Launch** the app — a small control panel appears
-2. **Open Image** — click the button and select your reference image
-3. **Adjust Opacity** — use the slider to set how transparent the overlay is
+2. **Open Image** — click the button or press `Ctrl+O`
+3. **Adjust Opacity** — use the slider or `Ctrl+[` / `Ctrl+]`
 4. **Position & Resize** — drag the overlay or its edges to fit your canvas
-5. **Enable Click-Through** — toggle the button, then draw freely in the app underneath
-6. **Disable Click-Through** — toggle again to reposition or resize the overlay
+5. **Enable Click-Through** — press `Ctrl+T`, then draw freely in the app underneath
+6. **Disable Click-Through** — press `Ctrl+T` again to reposition or resize
 
-### Workflow Example
+## Keyboard Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl+O` | Open image |
+| `Ctrl+T` | Toggle click-through mode |
+| `Ctrl+H` | Hide / show overlay |
+| `Ctrl+[` | Decrease opacity |
+| `Ctrl+]` | Increase opacity |
+| `Ctrl+F` | Fit overlay to original image size |
+
+## Workflow Example
 
 ```
 1. Open your drawing app (Paint, Clip Studio, Photoshop, etc.)
-2. Launch Trace Overlay and load a reference image
-3. Set opacity to ~30-50%
+2. Launch Trace Overlay and load a reference image (Ctrl+O)
+3. Set opacity to ~30-50% (Ctrl+[ or Ctrl+])
 4. Position the overlay over your canvas
-5. Enable click-through mode
+5. Enable click-through mode (Ctrl+T)
 6. Start tracing!
 ```
 
@@ -91,13 +103,12 @@ trace-overlay/
 Contributions are welcome! Feel free to open issues or submit pull requests.
 
 Some ideas for future improvements:
-- [ ] Keyboard shortcuts (toggle click-through, adjust opacity)
 - [ ] Image rotation and flip
 - [ ] Multiple overlay windows
-- [ ] Horizontal/vertical flip
 - [ ] Grid overlay option
 - [ ] macOS support (alternative to Win32 click-through)
 - [ ] Remember last window position and settings
+- [ ] Drag-and-drop image loading
 
 ## License
 
@@ -105,4 +116,4 @@ Some ideas for future improvements:
 
 ---
 
-**한국어**: 그림 트레이싱 연습을 위한 반투명 오버레이 프로그램입니다. 이미지를 반투명하게 띄워두고 클릭 통과 모드를 켜면, 아래에 있는 그림판이나 클립스튜디오에서 바로 따라 그릴 수 있습니다.
+**Korean**: 그림 트레이싱 연습을 위한 반투명 오버레이 프로그램입니다. 이미지를 반투명하게 띄워두고 클릭 통과 모드를 켜면, 아래에 있는 그림판이나 클립스튜디오에서 바로 따라 그릴 수 있습니다.

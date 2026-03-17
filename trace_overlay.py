@@ -17,10 +17,10 @@ import os
 import ctypes
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QSlider, QSpinBox,
-    QVBoxLayout, QHBoxLayout, QFrame, QFileDialog, QMessageBox, QSizeGrip,
+    QVBoxLayout, QHBoxLayout, QFrame, QFileDialog, QMessageBox, QShortcut,
 )
 from PyQt5.QtCore import Qt, QPoint, QRect
-from PyQt5.QtGui import QPainter, QPixmap, QColor, QPen, QCursor, QIcon
+from PyQt5.QtGui import QPainter, QPixmap, QColor, QPen, QKeySequence
 
 # ── Win32 constants ───────────────────────────────────────────
 GWL_EXSTYLE = -20
@@ -28,8 +28,9 @@ WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
 
 EDGE_MARGIN = 8  # px — resize handle detection zone
+OPACITY_STEP = 5  # % per keyboard shortcut press
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 
 class OverlayWindow(QWidget):
@@ -78,7 +79,7 @@ class OverlayWindow(QWidget):
         self.update()
 
     def set_opacity(self, value: float):
-        self.opacity_value = value
+        self.opacity_value = max(0.05, min(1.0, value))
         self.update()
 
     # ── Painting ─────────────────────────────────────────────
@@ -224,6 +225,7 @@ class ControlPanel(QWidget):
         super().__init__()
         self.overlay = OverlayWindow()
         self._build_ui()
+        self._setup_shortcuts()
 
     def _build_ui(self):
         self.setWindowTitle("Trace Overlay")
@@ -247,7 +249,7 @@ class ControlPanel(QWidget):
         root.addWidget(self._sep())
 
         # ── Open Image ──
-        self.open_btn = QPushButton("Open Image")
+        self.open_btn = QPushButton("Open Image  (Ctrl+O)")
         self.open_btn.setStyleSheet(
             self.open_btn.styleSheet()
             + "font-size: 14px; padding: 10px;"
@@ -263,7 +265,7 @@ class ControlPanel(QWidget):
         root.addWidget(self._sep())
 
         # ── Opacity ──
-        root.addWidget(QLabel("Opacity"))
+        root.addWidget(QLabel("Opacity  (Ctrl+[ / Ctrl+])"))
         row = QHBoxLayout()
         self.opacity_slider = QSlider(Qt.Horizontal)
         self.opacity_slider.setRange(5, 100)
@@ -279,7 +281,7 @@ class ControlPanel(QWidget):
         root.addWidget(self._sep())
 
         # ── Click-through toggle ──
-        self.lock_btn = QPushButton("Enable Click-Through")
+        self.lock_btn = QPushButton("Enable Click-Through  (Ctrl+T)")
         self.lock_btn.setCheckable(True)
         self.lock_btn.toggled.connect(self._toggle_click_through)
         root.addWidget(self.lock_btn)
@@ -313,10 +315,27 @@ class ControlPanel(QWidget):
         size_row.addWidget(apply_btn)
         root.addLayout(size_row)
 
-        self.fit_btn = QPushButton("Fit to Original Image Size")
+        self.fit_btn = QPushButton("Fit to Original Image Size  (Ctrl+F)")
         self.fit_btn.clicked.connect(self._fit_to_image)
         self.fit_btn.setEnabled(False)
         root.addWidget(self.fit_btn)
+
+        root.addWidget(self._sep())
+
+        # ── Shortcut reference ──
+        shortcuts_text = (
+            "Ctrl+O  Open image\n"
+            "Ctrl+T  Toggle click-through\n"
+            "Ctrl+H  Hide / show overlay\n"
+            "Ctrl+[  Opacity down\n"
+            "Ctrl+]  Opacity up\n"
+            "Ctrl+F  Fit to image size"
+        )
+        sc_label = QLabel(shortcuts_text)
+        sc_label.setStyleSheet(
+            "color: #888; font-size: 10px; font-family: 'Consolas', 'Courier New', monospace;"
+        )
+        root.addWidget(sc_label)
 
         root.addStretch()
 
@@ -327,6 +346,28 @@ class ControlPanel(QWidget):
         root.addWidget(footer)
 
         self.setLayout(root)
+
+    def _setup_shortcuts(self):
+        """Register global keyboard shortcuts on the control panel."""
+        # Ctrl+O — Open image
+        QShortcut(QKeySequence("Ctrl+O"), self).activated.connect(self._open_image)
+
+        # Ctrl+T — Toggle click-through
+        QShortcut(QKeySequence("Ctrl+T"), self).activated.connect(
+            lambda: self.lock_btn.toggle()
+        )
+
+        # Ctrl+H — Hide / show overlay
+        QShortcut(QKeySequence("Ctrl+H"), self).activated.connect(self._toggle_overlay_visible)
+
+        # Ctrl+[ — Decrease opacity
+        QShortcut(QKeySequence("Ctrl+["), self).activated.connect(self._opacity_down)
+
+        # Ctrl+] — Increase opacity
+        QShortcut(QKeySequence("Ctrl+]"), self).activated.connect(self._opacity_up)
+
+        # Ctrl+F — Fit to image size
+        QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(self._fit_to_image)
 
     @staticmethod
     def _sep() -> QFrame:
@@ -370,12 +411,26 @@ class ControlPanel(QWidget):
         self.opacity_label.setText(f"{value}%")
         self.overlay.set_opacity(value / 100.0)
 
+    def _opacity_down(self):
+        new_val = max(5, self.opacity_slider.value() - OPACITY_STEP)
+        self.opacity_slider.setValue(new_val)
+
+    def _opacity_up(self):
+        new_val = min(100, self.opacity_slider.value() + OPACITY_STEP)
+        self.opacity_slider.setValue(new_val)
+
     def _toggle_click_through(self, checked: bool):
         self.overlay.set_click_through(checked)
         if checked:
-            self.lock_btn.setText("Disable Click-Through")
+            self.lock_btn.setText("Disable Click-Through  (Ctrl+T)")
         else:
-            self.lock_btn.setText("Enable Click-Through")
+            self.lock_btn.setText("Enable Click-Through  (Ctrl+T)")
+
+    def _toggle_overlay_visible(self):
+        if self.overlay.isVisible():
+            self.overlay.hide()
+        else:
+            self.overlay.show()
 
     def _apply_size(self):
         self.overlay.resize(self.w_spin.value(), self.h_spin.value())
