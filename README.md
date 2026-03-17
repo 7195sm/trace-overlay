@@ -20,8 +20,11 @@ Think of it as **digital tracing paper** for your monitor.
 
 - **Click-Through Mode** — Mouse clicks pass through the overlay to the app below (Windows API)
 - **Adjustable Opacity** — Slider from 5% to 100%
+- **Rotation & Flip** — Rotate 90° CW/CCW, flip horizontal/vertical
+- **Drag & Drop** — Drop an image file onto the control panel to load it
 - **Resizable Overlay** — Drag edges or set exact pixel dimensions
 - **Always on Top** — Overlay stays above all other windows
+- **Remembers Settings** — Window positions, opacity, last image, and transform are saved automatically
 - **Keyboard Shortcuts** — Control everything without leaving your drawing app
 - **Lightweight** — Single Python file, minimal dependencies
 
@@ -51,11 +54,12 @@ The executable will be in the `dist/` folder.
 ## How to Use
 
 1. **Launch** the app — a small control panel appears
-2. **Open Image** — click the button or press `Ctrl+O`
+2. **Open Image** — click the button, press `Ctrl+O`, or drag & drop an image file
 3. **Adjust Opacity** — use the slider or `Ctrl+[` / `Ctrl+]`
 4. **Position & Resize** — drag the overlay or its edges to fit your canvas
-5. **Enable Click-Through** — press `Ctrl+T`, then draw freely in the app underneath
-6. **Disable Click-Through** — press `Ctrl+T` again to reposition or resize
+5. **Rotate / Flip** — use the buttons or keyboard shortcuts to transform the image
+6. **Enable Click-Through** — press `Ctrl+T`, then draw freely in the app underneath
+7. **Close** — all settings (positions, opacity, image, transform) are saved automatically
 
 ## Keyboard Shortcuts
 
@@ -66,18 +70,30 @@ The executable will be in the `dist/` folder.
 | `Ctrl+H` | Hide / show overlay |
 | `Ctrl+[` | Decrease opacity |
 | `Ctrl+]` | Increase opacity |
+| `Ctrl+R` | Rotate clockwise 90° |
+| `Ctrl+Shift+R` | Rotate counter-clockwise 90° |
+| `Ctrl+Shift+H` | Flip horizontal |
+| `Ctrl+Shift+V` | Flip vertical |
 | `Ctrl+F` | Fit overlay to original image size |
 
 ## Workflow Example
 
 ```
 1. Open your drawing app (Paint, Clip Studio, Photoshop, etc.)
-2. Launch Trace Overlay and load a reference image (Ctrl+O)
+2. Launch Trace Overlay and load a reference image (Ctrl+O or drag & drop)
 3. Set opacity to ~30-50% (Ctrl+[ or Ctrl+])
-4. Position the overlay over your canvas
-5. Enable click-through mode (Ctrl+T)
-6. Start tracing!
+4. Rotate or flip the image if needed (Ctrl+R, Ctrl+Shift+H, etc.)
+5. Position the overlay over your canvas
+6. Enable click-through mode (Ctrl+T)
+7. Start tracing!
 ```
+
+## Settings
+
+Settings are saved automatically when you close the app to:  
+`%APPDATA%\TraceOverlay\settings.json`
+
+Saved data includes: panel position, overlay position & size, opacity, last loaded image path, and rotation/flip state.
 
 ## Requirements
 
@@ -101,14 +117,6 @@ trace-overlay/
 ## Contributing
 
 Contributions are welcome! Feel free to open issues or submit pull requests.
-
-Some ideas for future improvements:
-- [ ] Image rotation and flip
-- [ ] Multiple overlay windows
-- [ ] Grid overlay option
-- [ ] macOS support (alternative to Win32 click-through)
-- [ ] Remember last window position and settings
-- [ ] Drag-and-drop image loading
 
 ## License
 

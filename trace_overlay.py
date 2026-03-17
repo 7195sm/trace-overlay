@@ -15,22 +15,67 @@ Platform: Windows 10/11 (click-through uses Win32 API)
 import sys
 import os
 import ctypes
+import json
+from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QSlider, QSpinBox,
     QVBoxLayout, QHBoxLayout, QFrame, QFileDialog, QMessageBox, QShortcut,
 )
-from PyQt5.QtCore import Qt, QPoint, QRect
-from PyQt5.QtGui import QPainter, QPixmap, QColor, QPen, QKeySequence
+from PyQt5.QtCore import Qt, QPoint, QRect, QUrl
+from PyQt5.QtGui import (
+    QPainter, QPixmap, QColor, QPen, QKeySequence, QTransform, QDragEnterEvent,
+    QDropEvent,
+)
 
 # ── Win32 constants ───────────────────────────────────────────
 GWL_EXSTYLE = -20
 WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
 
-EDGE_MARGIN = 8  # px — resize handle detection zone
-OPACITY_STEP = 5  # % per keyboard shortcut press
+EDGE_MARGIN = 8       # px — resize handle detection zone
+OPACITY_STEP = 5      # % per keyboard shortcut press
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tiff"}
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
+
+# ── Settings persistence ─────────────────────────────────────
+SETTINGS_DIR = Path(os.environ.get("APPDATA", Path.home())) / "TraceOverlay"
+SETTINGS_FILE = SETTINGS_DIR / "settings.json"
+
+DEFAULT_SETTINGS = {
+    "panel_x": 100,
+    "panel_y": 100,
+    "overlay_x": 200,
+    "overlay_y": 100,
+    "overlay_w": 800,
+    "overlay_h": 600,
+    "opacity": 50,
+    "last_image": "",
+    "rotation": 0,
+    "flip_h": False,
+    "flip_v": False,
+}
+
+
+def load_settings() -> dict:
+    try:
+        if SETTINGS_FILE.exists():
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            # Merge with defaults so new keys are always present
+            return {**DEFAULT_SETTINGS, **saved}
+    except Exception:
+        pass
+    return dict(DEFAULT_SETTINGS)
+
+
+def save_settings(data: dict):
+    try:
+        SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
 
 
 class OverlayWindow(QWidget):
@@ -39,7 +84,11 @@ class OverlayWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.image: QPixmap | None = None
+        self._display_image: QPixmap | None = None  # transformed cache
         self.opacity_value: float = 0.5
+        self._rotation: int = 0          # 0, 90, 180, 270
+        self._flip_h: bool = False
+        self._flip_v: bool = False
         self._click_through: bool = False
         self._dragging: bool = False
         self._resizing: bool = False
@@ -76,10 +125,63 @@ class OverlayWindow(QWidget):
     # ── Image / Opacity ──────────────────────────────────────
     def set_image(self, pixmap: QPixmap):
         self.image = pixmap
-        self.update()
+        self._rebuild_display()
 
     def set_opacity(self, value: float):
         self.opacity_value = max(0.05, min(1.0, value))
+        self.update()
+
+    # ── Rotation & Flip ──────────────────────────────────────
+    def rotate_cw(self):
+        self._rotation = (self._rotation + 90) % 360
+        self._rebuild_display()
+
+    def rotate_ccw(self):
+        self._rotation = (self._rotation - 90) % 360
+        self._rebuild_display()
+
+    def flip_horizontal(self):
+        self._flip_h = not self._flip_h
+        self._rebuild_display()
+
+    def flip_vertical(self):
+        self._flip_v = not self._flip_v
+        self._rebuild_display()
+
+    def set_transform(self, rotation: int, flip_h: bool, flip_v: bool):
+        """Restore transform state (e.g. from saved settings)."""
+        self._rotation = rotation % 360
+        self._flip_h = flip_h
+        self._flip_v = flip_v
+        if self.image:
+            self._rebuild_display()
+
+    @property
+    def rotation(self) -> int:
+        return self._rotation
+
+    @property
+    def flip_h(self) -> bool:
+        return self._flip_h
+
+    @property
+    def flip_v(self) -> bool:
+        return self._flip_v
+
+    def _rebuild_display(self):
+        """Apply rotation + flip to the source image and cache the result."""
+        if not self.image:
+            self._display_image = None
+            self.update()
+            return
+        xform = QTransform()
+        if self._rotation:
+            xform = xform.rotate(self._rotation)
+        if self._flip_h:
+            xform = xform.scale(-1, 1)
+        if self._flip_v:
+            xform = xform.scale(1, -1)
+        self._display_image = self.image.transformed(xform, Qt.SmoothTransformation)
         self.update()
 
     # ── Painting ─────────────────────────────────────────────
@@ -88,18 +190,17 @@ class OverlayWindow(QWidget):
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
 
         if not self._click_through:
-            # Edit mode: show light background + dashed border
             painter.fillRect(self.rect(), QColor(40, 40, 40, 25))
             painter.setPen(QPen(QColor(0, 120, 255, 120), 2, Qt.DashLine))
             painter.drawRect(1, 1, self.width() - 2, self.height() - 2)
         else:
-            # Click-through mode: subtle border only
             painter.setPen(QPen(QColor(100, 100, 100, 40), 1))
             painter.drawRect(0, 0, self.width() - 1, self.height() - 1)
 
-        if self.image:
+        img = self._display_image
+        if img:
             painter.setOpacity(self.opacity_value)
-            scaled = self.image.scaled(
+            scaled = img.scaled(
                 self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
             x = (self.width() - scaled.width()) // 2
@@ -224,14 +325,40 @@ class ControlPanel(QWidget):
     def __init__(self):
         super().__init__()
         self.overlay = OverlayWindow()
+        self._current_image_path: str = ""
+        self._settings = load_settings()
         self._build_ui()
         self._setup_shortcuts()
+        self._restore_settings()
+
+    # ── Drag-and-drop ────────────────────────────────────────
+    def _enable_drag_drop(self):
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    ext = Path(url.toLocalFile()).suffix.lower()
+                    if ext in IMAGE_EXTENSIONS:
+                        event.acceptProposedAction()
+                        return
+
+    def dropEvent(self, event: QDropEvent):
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                path = url.toLocalFile()
+                ext = Path(path).suffix.lower()
+                if ext in IMAGE_EXTENSIONS:
+                    self._load_image(path)
+                    return
 
     def _build_ui(self):
         self.setWindowTitle("Trace Overlay")
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.WindowCloseButtonHint)
         self.setFixedWidth(330)
         self.setStyleSheet(self.STYLE)
+        self._enable_drag_drop()
 
         root = QVBoxLayout()
         root.setContentsMargins(14, 14, 14, 14)
@@ -257,7 +384,7 @@ class ControlPanel(QWidget):
         self.open_btn.clicked.connect(self._open_image)
         root.addWidget(self.open_btn)
 
-        self.file_label = QLabel("No image loaded")
+        self.file_label = QLabel("No image loaded  (or drag && drop here)")
         self.file_label.setStyleSheet("color: gray; font-size: 11px;")
         self.file_label.setWordWrap(True)
         root.addWidget(self.file_label)
@@ -295,6 +422,42 @@ class ControlPanel(QWidget):
 
         root.addWidget(self._sep())
 
+        # ── Transform (rotation & flip) ──
+        root.addWidget(QLabel("Transform"))
+        xform_row = QHBoxLayout()
+        xform_row.setSpacing(4)
+
+        self.rot_ccw_btn = QPushButton("\u21b6 CCW")
+        self.rot_ccw_btn.setToolTip("Rotate counter-clockwise (Ctrl+Shift+R)")
+        self.rot_ccw_btn.clicked.connect(self._rotate_ccw)
+        xform_row.addWidget(self.rot_ccw_btn)
+
+        self.rot_cw_btn = QPushButton("CW \u21b7")
+        self.rot_cw_btn.setToolTip("Rotate clockwise (Ctrl+R)")
+        self.rot_cw_btn.clicked.connect(self._rotate_cw)
+        xform_row.addWidget(self.rot_cw_btn)
+
+        self.flip_h_btn = QPushButton("\u2194 Flip H")
+        self.flip_h_btn.setToolTip("Flip horizontal (Ctrl+Shift+H)")
+        self.flip_h_btn.setCheckable(True)
+        self.flip_h_btn.clicked.connect(self._flip_h)
+        xform_row.addWidget(self.flip_h_btn)
+
+        self.flip_v_btn = QPushButton("\u2195 Flip V")
+        self.flip_v_btn.setToolTip("Flip vertical (Ctrl+Shift+V)")
+        self.flip_v_btn.setCheckable(True)
+        self.flip_v_btn.clicked.connect(self._flip_v)
+        xform_row.addWidget(self.flip_v_btn)
+
+        root.addLayout(xform_row)
+
+        self.rot_label = QLabel("0\u00b0")
+        self.rot_label.setStyleSheet("color: #999; font-size: 10px;")
+        self.rot_label.setAlignment(Qt.AlignCenter)
+        root.addWidget(self.rot_label)
+
+        root.addWidget(self._sep())
+
         # ── Size controls ──
         root.addWidget(QLabel("Overlay Size"))
         size_row = QHBoxLayout()
@@ -324,12 +487,15 @@ class ControlPanel(QWidget):
 
         # ── Shortcut reference ──
         shortcuts_text = (
-            "Ctrl+O  Open image\n"
-            "Ctrl+T  Toggle click-through\n"
-            "Ctrl+H  Hide / show overlay\n"
-            "Ctrl+[  Opacity down\n"
-            "Ctrl+]  Opacity up\n"
-            "Ctrl+F  Fit to image size"
+            "Ctrl+O          Open image\n"
+            "Ctrl+T          Toggle click-through\n"
+            "Ctrl+H          Hide / show overlay\n"
+            "Ctrl+[ / ]      Opacity down / up\n"
+            "Ctrl+R          Rotate CW 90\u00b0\n"
+            "Ctrl+Shift+R    Rotate CCW 90\u00b0\n"
+            "Ctrl+Shift+H    Flip horizontal\n"
+            "Ctrl+Shift+V    Flip vertical\n"
+            "Ctrl+F          Fit to image size"
         )
         sc_label = QLabel(shortcuts_text)
         sc_label.setStyleSheet(
@@ -348,26 +514,63 @@ class ControlPanel(QWidget):
         self.setLayout(root)
 
     def _setup_shortcuts(self):
-        """Register global keyboard shortcuts on the control panel."""
-        # Ctrl+O — Open image
+        """Register keyboard shortcuts on the control panel."""
         QShortcut(QKeySequence("Ctrl+O"), self).activated.connect(self._open_image)
-
-        # Ctrl+T — Toggle click-through
         QShortcut(QKeySequence("Ctrl+T"), self).activated.connect(
             lambda: self.lock_btn.toggle()
         )
-
-        # Ctrl+H — Hide / show overlay
         QShortcut(QKeySequence("Ctrl+H"), self).activated.connect(self._toggle_overlay_visible)
-
-        # Ctrl+[ — Decrease opacity
         QShortcut(QKeySequence("Ctrl+["), self).activated.connect(self._opacity_down)
-
-        # Ctrl+] — Increase opacity
         QShortcut(QKeySequence("Ctrl+]"), self).activated.connect(self._opacity_up)
-
-        # Ctrl+F — Fit to image size
         QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(self._fit_to_image)
+
+        # Rotation & flip
+        QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(self._rotate_cw)
+        QShortcut(QKeySequence("Ctrl+Shift+R"), self).activated.connect(self._rotate_ccw)
+        QShortcut(QKeySequence("Ctrl+Shift+H"), self).activated.connect(self._flip_h)
+        QShortcut(QKeySequence("Ctrl+Shift+V"), self).activated.connect(self._flip_v)
+
+    # ── Settings persistence ─────────────────────────────────
+    def _restore_settings(self):
+        s = self._settings
+        self.move(s["panel_x"], s["panel_y"])
+        self.overlay.move(s["overlay_x"], s["overlay_y"])
+        self.overlay.resize(s["overlay_w"], s["overlay_h"])
+        self.w_spin.setValue(s["overlay_w"])
+        self.h_spin.setValue(s["overlay_h"])
+        self.opacity_slider.setValue(s["opacity"])
+
+        # Restore last image if it still exists
+        last = s.get("last_image", "")
+        if last and os.path.isfile(last):
+            self._load_image(last)
+            # Restore transform after image is loaded
+            self.overlay.set_transform(
+                s.get("rotation", 0),
+                s.get("flip_h", False),
+                s.get("flip_v", False),
+            )
+            self.flip_h_btn.setChecked(self.overlay.flip_h)
+            self.flip_v_btn.setChecked(self.overlay.flip_v)
+            self._update_rot_label()
+
+    def _save_settings(self):
+        pos = self.pos()
+        opos = self.overlay.pos()
+        data = {
+            "panel_x": pos.x(),
+            "panel_y": pos.y(),
+            "overlay_x": opos.x(),
+            "overlay_y": opos.y(),
+            "overlay_w": self.overlay.width(),
+            "overlay_h": self.overlay.height(),
+            "opacity": self.opacity_slider.value(),
+            "last_image": self._current_image_path,
+            "rotation": self.overlay.rotation,
+            "flip_h": self.overlay.flip_h,
+            "flip_v": self.overlay.flip_v,
+        }
+        save_settings(data)
 
     @staticmethod
     def _sep() -> QFrame:
@@ -376,21 +579,14 @@ class ControlPanel(QWidget):
         line.setStyleSheet("color: #e0e0e0;")
         return line
 
-    # ── Slots ─────────────────────────────────────────────────
-    def _open_image(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open Image",
-            "",
-            "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tiff);;All Files (*)",
-        )
-        if not path:
-            return
+    # ── Image loading (shared by open, drop, and restore) ────
+    def _load_image(self, path: str):
         pixmap = QPixmap(path)
         if pixmap.isNull():
             QMessageBox.warning(self, "Error", "Could not load this image.")
             return
 
+        self._current_image_path = path
         self.overlay.set_image(pixmap)
 
         # Constrain to screen size
@@ -404,20 +600,35 @@ class ControlPanel(QWidget):
         self.overlay.show()
         self.fit_btn.setEnabled(True)
 
+        # Reset transform for new image
+        self.overlay.set_transform(0, False, False)
+        self.flip_h_btn.setChecked(False)
+        self.flip_v_btn.setChecked(False)
+        self._update_rot_label()
+
         name = os.path.basename(path)
         self.file_label.setText(f"{name}  ({pixmap.width()} \u00d7 {pixmap.height()} px)")
+
+    # ── Slots ─────────────────────────────────────────────────
+    def _open_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Image",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tiff);;All Files (*)",
+        )
+        if path:
+            self._load_image(path)
 
     def _on_opacity(self, value: int):
         self.opacity_label.setText(f"{value}%")
         self.overlay.set_opacity(value / 100.0)
 
     def _opacity_down(self):
-        new_val = max(5, self.opacity_slider.value() - OPACITY_STEP)
-        self.opacity_slider.setValue(new_val)
+        self.opacity_slider.setValue(max(5, self.opacity_slider.value() - OPACITY_STEP))
 
     def _opacity_up(self):
-        new_val = min(100, self.opacity_slider.value() + OPACITY_STEP)
-        self.opacity_slider.setValue(new_val)
+        self.opacity_slider.setValue(min(100, self.opacity_slider.value() + OPACITY_STEP))
 
     def _toggle_click_through(self, checked: bool):
         self.overlay.set_click_through(checked)
@@ -432,6 +643,30 @@ class ControlPanel(QWidget):
         else:
             self.overlay.show()
 
+    def _rotate_cw(self):
+        self.overlay.rotate_cw()
+        self._update_rot_label()
+
+    def _rotate_ccw(self):
+        self.overlay.rotate_ccw()
+        self._update_rot_label()
+
+    def _flip_h(self):
+        self.overlay.flip_horizontal()
+        self.flip_h_btn.setChecked(self.overlay.flip_h)
+
+    def _flip_v(self):
+        self.overlay.flip_vertical()
+        self.flip_v_btn.setChecked(self.overlay.flip_v)
+
+    def _update_rot_label(self):
+        parts = [f"{self.overlay.rotation}\u00b0"]
+        if self.overlay.flip_h:
+            parts.append("H-flip")
+        if self.overlay.flip_v:
+            parts.append("V-flip")
+        self.rot_label.setText("  |  ".join(parts))
+
     def _apply_size(self):
         self.overlay.resize(self.w_spin.value(), self.h_spin.value())
 
@@ -445,6 +680,7 @@ class ControlPanel(QWidget):
             self.h_spin.setValue(h)
 
     def closeEvent(self, event):
+        self._save_settings()
         self.overlay.close()
         event.accept()
 
