@@ -20,10 +20,9 @@ Think of it as **digital tracing paper** for your monitor.
 
 - **Click-Through Mode** — Mouse clicks pass through the overlay to the app below
 - **Adjustable Opacity** — Slider from 5% to 100%
-- **Zoom** — Ctrl+scroll to zoom at cursor position; wide range (10%–1000%)
+- **Zoom** — Ctrl+scroll to zoom(10%–1000%) at cursor position
 - **Edge Detection** — Extract outlines only with Sobel filter (Ctrl+S)
 - **Precise Rotation** — 0–360° slider + drag rotation handle on overlay
-- **PPT-style Handles** — Resize handles at edges/corners, rotation handle at top
 - **Flip** — Horizontal and vertical
 - **Stretch & Resize** — Aspect ratio lock on/off; image stretches when off
 - **Drag & Drop** — Drop image files directly onto the control panel
@@ -82,4 +81,4 @@ pyinstaller --onefile --windowed --name TraceOverlay trace_overlay.py
 
 ---
 
-**Korean**: 그림 트레이싱 연습을 위한 반투명 오버레이 프로그램입니다. 이미지를 반투명하게 띄워두고 클릭 통과 모드를 켜면, 아래에 있는 그림판이나 클립스튜디오에서 바로 따라 그릴 수 있습니다.
+**Korean**: 반투명 오버레이 프로그램입니다. 이미지를 반투명하게 띄워두고 클릭 통과 모드를 켜면, 아래에 있는 그림판이나 클립스튜디오에서 바로 따라 그릴 수 있습니다.
