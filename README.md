@@ -76,18 +76,6 @@ The executable will be in the `dist/` folder.
 | `Ctrl+Shift+V` | Flip vertical |
 | `Ctrl+F` | Fit overlay to original image size |
 
-## Workflow Example
-
-```
-1. Open your drawing app (Paint, Clip Studio, Photoshop, etc.)
-2. Launch Trace Overlay and load a reference image (Ctrl+O or drag & drop)
-3. Set opacity to ~30-50% (Ctrl+[ or Ctrl+])
-4. Rotate or flip the image if needed (Ctrl+R, Ctrl+Shift+H, etc.)
-5. Position the overlay over your canvas
-6. Enable click-through mode (Ctrl+T)
-7. Start tracing!
-```
-
 ## Settings
 
 Settings are saved automatically when you close the app to:  
