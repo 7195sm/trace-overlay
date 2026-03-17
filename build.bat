@@ -14,10 +14,10 @@ if errorlevel 1 (
 )
 
 echo [1/3] Installing packages...
-pip install PyQt5 pyinstaller --quiet
+pip install PyQt5 Pillow pyinstaller --quiet
 
 echo [2/3] Building EXE... (takes 1-2 min)
-pyinstaller --noconfirm --onefile --windowed --name "TraceOverlay" --clean trace_overlay.py
+pyinstaller --noconfirm --onefile --windowed --name "TraceOverlay" --hidden-import PIL --hidden-import PIL.Image --hidden-import PIL.ImageFilter --hidden-import PIL.ImageOps --clean trace_overlay.py
 
 echo.
 if exist "dist\TraceOverlay.exe" (

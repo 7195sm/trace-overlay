@@ -26,11 +26,11 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install PyQt5 pyinstaller
+          pip install PyQt5 Pillow pyinstaller
 
       - name: Build EXE
         run: |
-          pyinstaller --noconfirm --onefile --windowed --name TraceOverlay trace_overlay.py
+          pyinstaller --noconfirm --onefile --windowed --name TraceOverlay --hidden-import PIL --hidden-import PIL.Image --hidden-import PIL.ImageFilter --hidden-import PIL.ImageOps trace_overlay.py
 
       - name: Upload EXE to Release
         if: github.event_name == 'release'

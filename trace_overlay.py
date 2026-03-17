@@ -1,803 +1,695 @@
 """
-Trace Overlay — Transparent image overlay for tracing practice.
-
-A lightweight always-on-top tool that displays a semi-transparent image
-over your screen. Enable click-through mode to draw in the app underneath
-(MS Paint, Clip Studio, Photoshop, etc.) while seeing the reference above.
+Trace Overlay v2.2.0 — Transparent image overlay for tracing practice.
 
 Usage:
-    pip install PyQt5
+    pip install PyQt5 Pillow
     python trace_overlay.py
 
 Platform: Windows 10/11 (click-through uses Win32 API)
 """
 
-import sys
-import os
-import ctypes
-import json
+import sys, os, math, ctypes, json
 from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QSlider, QSpinBox, QCheckBox,
     QVBoxLayout, QHBoxLayout, QFrame, QFileDialog, QMessageBox, QShortcut,
 )
-from PyQt5.QtCore import Qt, QPoint, QRect, QUrl
+from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QUrl
 from PyQt5.QtGui import (
-    QPainter, QPixmap, QColor, QPen, QKeySequence, QTransform, QDragEnterEvent,
-    QDropEvent,
+    QPainter, QPixmap, QColor, QPen, QKeySequence, QTransform, QImage,
+    QDragEnterEvent, QDropEvent, QBrush, QCursor,
 )
 
-# ── Win32 constants ───────────────────────────────────────────
-GWL_EXSTYLE = -20
+try:
+    from PIL import Image, ImageFilter, ImageOps
+    HAS_PILLOW = True
+except ImportError:
+    HAS_PILLOW = False
+
+# ── Constants ─────────────────────────────────────────────────
+GWL_EXSTYLE   = -20
 WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
 
-EDGE_MARGIN = 8       # px — resize handle detection zone
-OPACITY_STEP = 5      # % per keyboard shortcut press
-ROTATION_STEP = 2     # degrees per keyboard shortcut press
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tiff"}
+EDGE_MARGIN    = 10
+CORNER_MARGIN  = 16
+OPACITY_STEP   = 5
+ROTATION_STEP  = 2
+ARROW_STEP     = 1
+ARROW_SHIFT    = 20
+HANDLE_R       = 5      # handle circle radius
+ROT_HANDLE_Y   = 20     # rotation handle y inside overlay
+ROT_STEM_TOP   = 4      # stem starts here (y)
+ZOOM_MIN       = 0.1
+ZOOM_MAX       = 10.0
+ZOOM_WHEEL     = 0.1    # zoom step per wheel tick
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tiff"}
+VERSION = "2.2.0"
 
-VERSION = "1.4.0"
-
-# ── Settings persistence ─────────────────────────────────────
-SETTINGS_DIR = Path(os.environ.get("APPDATA", Path.home())) / "TraceOverlay"
+SETTINGS_DIR  = Path(os.environ.get("APPDATA", Path.home())) / "TraceOverlay"
 SETTINGS_FILE = SETTINGS_DIR / "settings.json"
-
-DEFAULT_SETTINGS = {
-    "panel_x": 100,
-    "panel_y": 100,
-    "overlay_x": 200,
-    "overlay_y": 100,
-    "overlay_w": 800,
-    "overlay_h": 600,
-    "opacity": 50,
-    "last_image": "",
-    "rotation": 0,
-    "flip_h": False,
-    "flip_v": False,
-    "lock_aspect": True,
+DEFAULTS = {
+    "panel_x": 100, "panel_y": 100,
+    "overlay_x": 200, "overlay_y": 100,
+    "overlay_w": 800, "overlay_h": 600,
+    "opacity": 50, "zoom": 100,
+    "last_image": "", "rotation": 0,
+    "flip_h": False, "flip_v": False,
+    "lock_aspect": True, "edge_detect": False,
 }
 
-
-def load_settings() -> dict:
+def load_settings():
     try:
         if SETTINGS_FILE.exists():
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-            return {**DEFAULT_SETTINGS, **saved}
+            with open(SETTINGS_FILE, "r") as f:
+                return {**DEFAULTS, **json.load(f)}
     except Exception:
         pass
-    return dict(DEFAULT_SETTINGS)
+    return dict(DEFAULTS)
 
-
-def save_settings(data: dict):
+def save_settings(d):
     try:
         SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(d, f, indent=2)
     except Exception:
         pass
 
+def qpixmap_to_pil(pm):
+    qi = pm.toImage().convertToFormat(QImage.Format_RGBA8888)
+    ptr = qi.bits(); ptr.setsize(qi.width() * qi.height() * 4)
+    return Image.frombuffer("RGBA", (qi.width(), qi.height()), bytes(ptr), "raw", "RGBA", 0, 1)
 
+def pil_to_qpixmap(img):
+    img = img.convert("RGBA"); d = img.tobytes("raw", "RGBA")
+    qi = QImage(d, img.width, img.height, img.width * 4, QImage.Format_RGBA8888)
+    return QPixmap.fromImage(qi.copy())
+
+def apply_edge_detection(pm):
+    if not HAS_PILLOW: return pm
+    return pil_to_qpixmap(ImageOps.invert(qpixmap_to_pil(pm).convert("L").filter(ImageFilter.FIND_EDGES)).convert("RGBA"))
+
+
+# ══════════════════════════════════════════════════════════════
 class OverlayWindow(QWidget):
-    """Frameless, always-on-top transparent overlay that displays an image."""
-
-    def __init__(self):
+# ══════════════════════════════════════════════════════════════
+    def __init__(self, panel):
         super().__init__()
-        self.image: QPixmap | None = None
-        self._display_image: QPixmap | None = None  # transformed cache
-        self.opacity_value: float = 0.5
-        self._rotation: float = 0.0       # 0.0 – 359.9
-        self._flip_h: bool = False
-        self._flip_v: bool = False
-        self._click_through: bool = False
-        self._dragging: bool = False
-        self._resizing: bool = False
-        self._drag_start: QPoint = QPoint()
-        self._resize_edge: str = ""
-        self._start_geometry: QRect = QRect()
-        self.lock_aspect: bool = True
-        self.aspect_ratio: float = 800 / 600
+        self.panel = panel
+        self.image = None
+        self.opacity_value = 0.5
+        self._rot = 0.0
+        self._flip_h = self._flip_v = False
+        self.lock_aspect = True
+        self.aspect_ratio = 4/3
+        self.zoom = 1.0
+        self.pan_x = self.pan_y = 0.0   # pixel offset of image center
+
+        self._click_through = False
+        self._dragging = self._resizing = self._rot_dragging = False
+        self._drag_start = QPoint()
+        self._resize_edge = ""
+        self._start_geom = QRect()
 
         self.setWindowTitle("Trace Overlay")
-        self.setWindowFlags(
-            Qt.FramelessWindowHint
-            | Qt.WindowStaysOnTopHint
-            | Qt.Tool  # hide from taskbar
-        )
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setMouseTracking(True)
         self.setMinimumSize(100, 100)
         self.resize(800, 600)
 
-    # ── Click-through ────────────────────────────────────────
-    def set_click_through(self, enabled: bool):
-        """Toggle WS_EX_TRANSPARENT so mouse events pass to windows below."""
-        if sys.platform != "win32":
-            return
-        self._click_through = enabled
+    # ── properties ───────────────────────────────────────────
+    @property
+    def rotation(self): return self._rot
+    @property
+    def flip_h(self): return self._flip_h
+    @property
+    def flip_v(self): return self._flip_v
+
+    def set_click_through(self, on):
+        if sys.platform != "win32": return
+        self._click_through = on
         hwnd = int(self.winId())
-        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        if enabled:
-            style |= WS_EX_LAYERED | WS_EX_TRANSPARENT
-        else:
-            style &= ~WS_EX_TRANSPARENT
-            style |= WS_EX_LAYERED
-        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
-
-    # ── Image / Opacity ──────────────────────────────────────
-    def set_image(self, pixmap: QPixmap):
-        self.image = pixmap
-        self._rebuild_display()
-
-    def set_opacity(self, value: float):
-        self.opacity_value = max(0.05, min(1.0, value))
+        s = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        if on:  s |= WS_EX_LAYERED | WS_EX_TRANSPARENT
+        else:   s = (s & ~WS_EX_TRANSPARENT) | WS_EX_LAYERED
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, s)
         self.update()
 
-    # ── Rotation & Flip ──────────────────────────────────────
-    def set_rotation(self, degrees: float):
-        self._rotation = degrees % 360
-        self._rebuild_display()
+    def set_image(self, pm):  self.image = pm; self.update()
+    def set_opacity(self, v): self.opacity_value = max(.05, min(1., v)); self.update()
+    def set_rotation(self, d): self._rot = d % 360; self.update()
+    def rotate_by(self, d):   self.set_rotation(self._rot + d)
+    def flip_horizontal(self): self._flip_h = not self._flip_h; self.update()
+    def flip_vertical(self):   self._flip_v = not self._flip_v; self.update()
+    def set_transform(self, r, fh, fv):
+        self._rot = r % 360; self._flip_h = fh; self._flip_v = fv; self.update()
 
-    def rotate_by(self, delta: float):
-        self.set_rotation(self._rotation + delta)
+    def set_zoom(self, z):
+        self.zoom = max(ZOOM_MIN, min(ZOOM_MAX, z)); self.update()
 
-    def flip_horizontal(self):
-        self._flip_h = not self._flip_h
-        self._rebuild_display()
-
-    def flip_vertical(self):
-        self._flip_v = not self._flip_v
-        self._rebuild_display()
-
-    def set_transform(self, rotation: float, flip_h: bool, flip_v: bool):
-        """Restore transform state (e.g. from saved settings)."""
-        self._rotation = rotation % 360
-        self._flip_h = flip_h
-        self._flip_v = flip_v
-        if self.image:
-            self._rebuild_display()
-
-    @property
-    def rotation(self) -> float:
-        return self._rotation
-
-    @property
-    def flip_h(self) -> bool:
-        return self._flip_h
-
-    @property
-    def flip_v(self) -> bool:
-        return self._flip_v
-
-    def _rebuild_display(self):
-        """Apply rotation + flip to the source image and cache the result."""
-        if not self.image:
-            self._display_image = None
-            self.update()
-            return
-        xform = QTransform()
-        if self._rotation:
-            xform = xform.rotate(self._rotation)
-        if self._flip_h:
-            xform = xform.scale(-1, 1)
-        if self._flip_v:
-            xform = xform.scale(1, -1)
-        self._display_image = self.image.transformed(xform, Qt.SmoothTransformation)
+    def zoom_at(self, factor, mx, my):
+        """Zoom so the point under (mx, my) stays fixed."""
+        old_z = self.zoom
+        new_z = max(ZOOM_MIN, min(ZOOM_MAX, old_z * factor))
+        if new_z == old_z: return
+        cx, cy = self.width()/2, self.height()/2
+        r = new_z / old_z
+        self.pan_x = (mx - cx) * (1 - r) + r * self.pan_x
+        self.pan_y = (my - cy) * (1 - r) + r * self.pan_y
+        self.zoom = new_z
         self.update()
 
-    # ── Painting ─────────────────────────────────────────────
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+    # ── handle positions ─────────────────────────────────────
+    def _handle_points(self):
+        """8 resize handles + 1 rotation handle (index 8)."""
+        w, h = self.width(), self.height()
+        return [
+            QPointF(0, 0), QPointF(w/2, 0), QPointF(w, 0),        # top L, C, R
+            QPointF(0, h/2), QPointF(w, h/2),                      # mid L, R
+            QPointF(0, h), QPointF(w/2, h), QPointF(w, h),         # bot L, C, R
+            QPointF(w/2, ROT_HANDLE_Y),                             # rotation handle
+        ]
+
+    def _hit_handle(self, pos, radius=12):
+        pts = self._handle_points()
+        for i, p in enumerate(pts):
+            if (pos.x()-p.x())**2 + (pos.y()-p.y())**2 <= radius**2:
+                return i
+        return -1
+
+    # ── painting ─────────────────────────────────────────────
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        p.setRenderHint(QPainter.Antialiasing)
 
         if not self._click_through:
-            painter.fillRect(self.rect(), QColor(40, 40, 40, 25))
-            painter.setPen(QPen(QColor(0, 120, 255, 120), 2, Qt.DashLine))
-            painter.drawRect(1, 1, self.width() - 2, self.height() - 2)
-        else:
-            painter.setPen(QPen(QColor(100, 100, 100, 40), 1))
-            painter.drawRect(0, 0, self.width() - 1, self.height() - 1)
+            # Border
+            p.setPen(QPen(QColor(120, 120, 120, 180), 1, Qt.SolidLine))
+            p.drawRect(0, 0, self.width()-1, self.height()-1)
 
-        img = self._display_image
-        if img:
-            painter.setOpacity(self.opacity_value)
-            scaled = img.scaled(
-                self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-            x = (self.width() - scaled.width()) // 2
-            y = (self.height() - scaled.height()) // 2
-            painter.drawPixmap(x, y, scaled)
+            # Handles
+            pts = self._handle_points()
+            handle_pen = QPen(QColor(120, 120, 120, 220), 1.5)
+            handle_brush = QBrush(QColor(255, 255, 255, 240))
+            p.setPen(handle_pen); p.setBrush(handle_brush)
+            for i, pt in enumerate(pts):
+                p.drawEllipse(pt, HANDLE_R, HANDLE_R)
 
-        painter.end()
+            # Rotation handle stem
+            rot_pt = pts[8]
+            top_center = QPointF(self.width()/2, ROT_STEM_TOP)
+            p.setPen(QPen(QColor(120, 120, 120, 180), 1.5))
+            p.drawLine(top_center, rot_pt)
 
-    # ── Mouse: drag to move & edge-resize ────────────────────
-    def _edge_at(self, pos: QPoint) -> str:
-        x, y = pos.x(), pos.y()
-        w, h = self.width(), self.height()
-        edges = ""
-        if y < EDGE_MARGIN:
-            edges += "t"
-        elif y > h - EDGE_MARGIN:
-            edges += "b"
-        if x < EDGE_MARGIN:
-            edges += "l"
-        elif x > w - EDGE_MARGIN:
-            edges += "r"
+            # Rotation arrow icon
+            p.setPen(QPen(QColor(80, 80, 80, 200), 1.5))
+            rc = rot_pt
+            p.drawArc(int(rc.x())-4, int(rc.y())-4, 8, 8, 30*16, 300*16)
+
+        # Image
+        if self.image:
+            p.setOpacity(self.opacity_value)
+
+            if self.lock_aspect:
+                scaled = self.image.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            else:
+                scaled = self.image.scaled(self.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+
+            cx, cy = self.width()/2, self.height()/2
+
+            p.save()
+            p.translate(cx + self.pan_x, cy + self.pan_y)
+            p.scale(self.zoom, self.zoom)
+            p.rotate(self._rot)
+            sx = -1.0 if self._flip_h else 1.0
+            sy = -1.0 if self._flip_v else 1.0
+            p.scale(sx, sy)
+            p.drawPixmap(-scaled.width()//2, -scaled.height()//2, scaled)
+            p.restore()
+
+        p.end()
+
+    # ── mouse interaction ────────────────────────────────────
+    def _edge_at(self, pos):
+        x, y, w, h = pos.x(), pos.y(), self.width(), self.height()
+        E = EDGE_MARGIN; edges = ""
+        if y < E: edges += "t"
+        elif y > h-E: edges += "b"
+        if x < E: edges += "l"
+        elif x > w-E: edges += "r"
         return edges
 
-    def _update_cursor(self, edges: str):
-        cursor_map = {
-            "t": Qt.SizeVerCursor, "b": Qt.SizeVerCursor,
-            "l": Qt.SizeHorCursor, "r": Qt.SizeHorCursor,
-            "tl": Qt.SizeFDiagCursor, "br": Qt.SizeFDiagCursor,
-            "tr": Qt.SizeBDiagCursor, "bl": Qt.SizeBDiagCursor,
-        }
-        self.setCursor(cursor_map.get(edges, Qt.ArrowCursor))
+    def _cursor_for_zone(self, pos):
+        # Check rotation handle first
+        hit = self._hit_handle(pos)
+        if hit == 8:
+            return Qt.CrossCursor
 
-    def mousePressEvent(self, event):
-        if self._click_through or event.button() != Qt.LeftButton:
+        edges = self._edge_at(pos)
+        m = {"t": Qt.SizeVerCursor, "b": Qt.SizeVerCursor,
+             "l": Qt.SizeHorCursor, "r": Qt.SizeHorCursor,
+             "tl": Qt.SizeFDiagCursor, "br": Qt.SizeFDiagCursor,
+             "tr": Qt.SizeBDiagCursor, "bl": Qt.SizeBDiagCursor}
+        return m.get(edges, Qt.ArrowCursor)
+
+    def mousePressEvent(self, ev):
+        if self._click_through or ev.button() != Qt.LeftButton: return
+
+        # Rotation handle?
+        if self._hit_handle(ev.pos()) == 8:
+            self._rot_dragging = True
             return
-        edges = self._edge_at(event.pos())
+
+        edges = self._edge_at(ev.pos())
         if edges:
-            self._resizing = True
-            self._resize_edge = edges
-            self._drag_start = event.globalPos()
-            self._start_geometry = self.geometry()
+            self._resizing = True; self._resize_edge = edges
+            self._drag_start = ev.globalPos(); self._start_geom = self.geometry()
         else:
             self._dragging = True
-            self._drag_start = event.globalPos() - self.pos()
+            self._drag_start = ev.globalPos() - self.pos()
 
-    def mouseMoveEvent(self, event):
-        if self._click_through:
+    def mouseMoveEvent(self, ev):
+        if self._click_through: return
+
+        if self._rot_dragging:
+            cx, cy = self.width()/2, self.height()/2
+            dx, dy = ev.pos().x() - cx, ev.pos().y() - cy
+            angle = math.degrees(math.atan2(dx, -dy)) % 360
+            self.set_rotation(angle)
+            self.panel._sync_rotation_from_overlay()
             return
-        if self._dragging:
-            self.move(event.globalPos() - self._drag_start)
-        elif self._resizing:
-            self._do_resize(event.globalPos())
-        else:
-            self._update_cursor(self._edge_at(event.pos()))
 
-    def mouseReleaseEvent(self, event):
-        self._dragging = False
-        self._resizing = False
+        if self._dragging:
+            self.move(ev.globalPos() - self._drag_start)
+        elif self._resizing:
+            self._do_resize(ev.globalPos())
+        else:
+            self.setCursor(self._cursor_for_zone(ev.pos()))
+
+    def mouseReleaseEvent(self, ev):
+        self._dragging = self._resizing = self._rot_dragging = False
         self._resize_edge = ""
 
-    def _do_resize(self, global_pos: QPoint):
-        dx = global_pos.x() - self._drag_start.x()
-        dy = global_pos.y() - self._drag_start.y()
-        g = QRect(self._start_geometry)
-        min_w, min_h = self.minimumWidth(), self.minimumHeight()
+    def _do_resize(self, gp):
+        dx = gp.x() - self._drag_start.x()
+        dy = gp.y() - self._drag_start.y()
+        g = QRect(self._start_geom)
+        mw, mh = self.minimumWidth(), self.minimumHeight()
+        e = self._resize_edge
 
-        if "r" in self._resize_edge:
-            g.setWidth(max(min_w, g.width() + dx))
-        if "b" in self._resize_edge:
-            g.setHeight(max(min_h, g.height() + dy))
-        if "l" in self._resize_edge:
-            new_left = g.left() + dx
-            if g.right() - new_left >= min_w:
-                g.setLeft(new_left)
-        if "t" in self._resize_edge:
-            new_top = g.top() + dy
-            if g.bottom() - new_top >= min_h:
-                g.setTop(new_top)
+        if "r" in e: g.setWidth(max(mw, g.width()+dx))
+        if "b" in e: g.setHeight(max(mh, g.height()+dy))
+        if "l" in e:
+            nl = g.left()+dx
+            if g.right()-nl >= mw: g.setLeft(nl)
+        if "t" in e:
+            nt = g.top()+dy
+            if g.bottom()-nt >= mh: g.setTop(nt)
 
-        # Apply aspect ratio constraint
         if self.lock_aspect and self.aspect_ratio > 0:
-            edge = self._resize_edge
-            has_h = ("l" in edge or "r" in edge)
-            has_v = ("t" in edge or "b" in edge)
-            if has_h and not has_v:
-                # Width changed — adjust height
-                g.setHeight(max(min_h, int(g.width() / self.aspect_ratio)))
-            elif has_v and not has_h:
-                # Height changed — adjust width
-                g.setWidth(max(min_w, int(g.height() * self.aspect_ratio)))
-            elif has_h and has_v:
-                # Corner drag — width leads
-                g.setHeight(max(min_h, int(g.width() / self.aspect_ratio)))
+            hh = ("l" in e or "r" in e); hv = ("t" in e or "b" in e)
+            if hh and not hv: g.setHeight(max(mh, int(g.width()/self.aspect_ratio)))
+            elif hv and not hh: g.setWidth(max(mw, int(g.height()*self.aspect_ratio)))
+            elif hh and hv: g.setHeight(max(mh, int(g.width()/self.aspect_ratio)))
 
         self.setGeometry(g)
 
+    # ── keyboard ─────────────────────────────────────────────
+    def keyPressEvent(self, ev):
+        s = ARROW_SHIFT if ev.modifiers() & Qt.ShiftModifier else ARROW_STEP
+        k = ev.key()
+        if   k == Qt.Key_Left:  self.move(self.x()-s, self.y())
+        elif k == Qt.Key_Right: self.move(self.x()+s, self.y())
+        elif k == Qt.Key_Up:    self.move(self.x(), self.y()-s)
+        elif k == Qt.Key_Down:  self.move(self.x(), self.y()+s)
+        else: super().keyPressEvent(ev)
 
+    # ── mouse wheel → zoom ───────────────────────────────────
+    def wheelEvent(self, ev):
+        if not (ev.modifiers() & Qt.ControlModifier):
+            super().wheelEvent(ev); return
+        if not self.image: return
+        delta = ev.angleDelta().y()
+        if delta == 0: return
+        factor = 1.0 + ZOOM_WHEEL if delta > 0 else 1.0 / (1.0 + ZOOM_WHEEL)
+        pos = ev.pos()
+        self.zoom_at(factor, pos.x(), pos.y())
+        self.panel._sync_zoom_from_overlay()
+
+
+# ══════════════════════════════════════════════════════════════
 class ControlPanel(QWidget):
-    """Control panel — the main window that manages the overlay."""
-
+# ══════════════════════════════════════════════════════════════
     STYLE = """
-        QWidget {
-            font-family: 'Segoe UI', 'Malgun Gothic', sans-serif;
-            font-size: 13px;
-        }
-        QPushButton {
-            padding: 7px 12px;
-            border: 1px solid #ccc;
-            border-radius: 4px;
-            background: #f5f5f5;
-        }
-        QPushButton:hover { background: #e8e8e8; }
-        QPushButton:pressed { background: #ddd; }
-        QPushButton:checked {
-            background: #d0e8ff;
-            border-color: #4a9eff;
-            color: #0060c0;
-        }
-        QSlider::groove:horizontal {
-            height: 6px;
-            background: #ddd;
-            border-radius: 3px;
-        }
-        QSlider::handle:horizontal {
-            width: 16px; height: 16px;
-            margin: -5px 0;
-            background: #4a9eff;
-            border-radius: 8px;
-        }
-        QSpinBox {
-            padding: 4px;
-            border: 1px solid #ccc;
-            border-radius: 3px;
-        }
+        QWidget { font-family:'Segoe UI','Malgun Gothic',sans-serif; font-size:13px; }
+        QPushButton { padding:7px 14px; border:1px solid #ccc; border-radius:4px;
+                      background:#f5f5f5; min-height:28px; }
+        QPushButton:hover { background:#e8e8e8; }
+        QPushButton:pressed { background:#ddd; }
+        QPushButton:checked { background:#d0e8ff; border-color:#4a9eff; color:#0060c0; }
+        QSlider::groove:horizontal { height:6px; background:#ddd; border-radius:3px; }
+        QSlider::handle:horizontal { width:16px; height:16px; margin:-5px 0;
+                                     background:#4a9eff; border-radius:8px; }
+        QSpinBox { padding:4px 6px; border:1px solid #ccc; border-radius:3px; min-height:24px; }
+        QCheckBox { spacing:6px; }
     """
 
     def __init__(self):
         super().__init__()
-        self.overlay = OverlayWindow()
-        self._current_image_path: str = ""
-        self._aspect_ratio: float = 800 / 600  # w / h
-        self._updating_spin: bool = False       # guard against recursive spin updates
+        self.overlay = OverlayWindow(self)
+        self._img_path = ""
+        self._orig_img = None
+        self._edge_img = None
+        self._ar = 4/3
+        self._spin_lock = False
+        self._edge_mode = False
         self._settings = load_settings()
         self._build_ui()
         self._setup_shortcuts()
-        self._restore_settings()
+        self._restore()
 
-    # ── Drag-and-drop ────────────────────────────────────────
-    def _enable_drag_drop(self):
-        self.setAcceptDrops(True)
+    # ── drag & drop ──────────────────────────────────────────
+    def dragEnterEvent(self, ev):
+        if ev.mimeData().hasUrls():
+            for u in ev.mimeData().urls():
+                if u.isLocalFile() and Path(u.toLocalFile()).suffix.lower() in IMAGE_EXTS:
+                    ev.acceptProposedAction(); return
 
-    def dragEnterEvent(self, event: QDragEnterEvent):
-        if event.mimeData().hasUrls():
-            for url in event.mimeData().urls():
-                if url.isLocalFile():
-                    ext = Path(url.toLocalFile()).suffix.lower()
-                    if ext in IMAGE_EXTENSIONS:
-                        event.acceptProposedAction()
-                        return
+    def dropEvent(self, ev):
+        for u in ev.mimeData().urls():
+            if u.isLocalFile():
+                p = u.toLocalFile()
+                if Path(p).suffix.lower() in IMAGE_EXTS:
+                    self._load_image(p); return
 
-    def dropEvent(self, event: QDropEvent):
-        for url in event.mimeData().urls():
-            if url.isLocalFile():
-                path = url.toLocalFile()
-                ext = Path(path).suffix.lower()
-                if ext in IMAGE_EXTENSIONS:
-                    self._load_image(path)
-                    return
-
+    # ── build UI ─────────────────────────────────────────────
     def _build_ui(self):
         self.setWindowTitle("Trace Overlay")
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.WindowCloseButtonHint)
-        self.setFixedWidth(330)
+        self.setFixedWidth(420); self.setAcceptDrops(True)
         self.setStyleSheet(self.STYLE)
-        self._enable_drag_drop()
 
-        root = QVBoxLayout()
-        root.setContentsMargins(14, 14, 14, 14)
-        root.setSpacing(8)
+        R = QVBoxLayout(); R.setContentsMargins(16,16,16,16); R.setSpacing(10)
 
-        # ── Title ──
-        title = QLabel("Trace Overlay")
-        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #333;")
-        root.addWidget(title)
-        subtitle = QLabel("Transparent image overlay for tracing practice")
-        subtitle.setStyleSheet("color: #888; font-size: 11px; margin-bottom: 4px;")
-        subtitle.setWordWrap(True)
-        root.addWidget(subtitle)
+        # Title
+        t = QLabel("Trace Overlay")
+        t.setStyleSheet("font-size:20px; font-weight:bold; color:#333;")
+        R.addWidget(t)
+        R.addWidget(self._lbl("Transparent image overlay for tracing practice", "#888", 11))
+        R.addWidget(self._sep())
 
-        root.addWidget(self._sep())
-
-        # ── Open Image ──
+        # Open
         self.open_btn = QPushButton("Open Image  (Ctrl+O)")
-        self.open_btn.setStyleSheet(
-            self.open_btn.styleSheet()
-            + "font-size: 14px; padding: 10px;"
+        self.open_btn.setStyleSheet(self.open_btn.styleSheet()+"font-size:14px; padding:10px 14px;")
+        self.open_btn.clicked.connect(self._open_image); R.addWidget(self.open_btn)
+        self.file_label = self._lbl("No image loaded  (or drag && drop here)", "gray", 11)
+        self.file_label.setWordWrap(True); R.addWidget(self.file_label)
+        R.addWidget(self._sep())
+
+        # Opacity
+        R.addWidget(QLabel("Opacity  (Ctrl+A / Ctrl+D)"))
+        h = QHBoxLayout()
+        self.opa_slider = QSlider(Qt.Horizontal); self.opa_slider.setRange(5,100); self.opa_slider.setValue(50)
+        self.opa_slider.valueChanged.connect(self._on_opacity); h.addWidget(self.opa_slider)
+        self.opa_lbl = QLabel("50%"); self.opa_lbl.setFixedWidth(44)
+        self.opa_lbl.setAlignment(Qt.AlignRight|Qt.AlignVCenter); h.addWidget(self.opa_lbl)
+        R.addLayout(h); R.addWidget(self._sep())
+
+        # Click-through
+        self.ct_btn = QPushButton("Enable Click-Through  (Ctrl+T)")
+        self.ct_btn.setCheckable(True); self.ct_btn.toggled.connect(self._toggle_ct); R.addWidget(self.ct_btn)
+        R.addWidget(self._lbl("ON \u2192 clicks pass through  |  OFF \u2192 move / resize", "#999", 10))
+        R.addWidget(self._sep())
+
+        # Edge
+        self.edge_btn = QPushButton("Edge Detection  (Ctrl+S)")
+        self.edge_btn.setCheckable(True); self.edge_btn.toggled.connect(self._toggle_edge)
+        if not HAS_PILLOW: self.edge_btn.setEnabled(False); self.edge_btn.setToolTip("pip install Pillow")
+        R.addWidget(self.edge_btn); R.addWidget(self._sep())
+
+        # Zoom
+        R.addWidget(QLabel("Zoom  (Ctrl+Scroll on overlay)"))
+        zh = QHBoxLayout()
+        self.zoom_slider = QSlider(Qt.Horizontal); self.zoom_slider.setRange(10, 1000); self.zoom_slider.setValue(100)
+        self.zoom_slider.valueChanged.connect(self._on_zoom_slider); zh.addWidget(self.zoom_slider)
+        self.zoom_lbl = QLabel("100%"); self.zoom_lbl.setFixedWidth(52)
+        self.zoom_lbl.setAlignment(Qt.AlignRight|Qt.AlignVCenter); zh.addWidget(self.zoom_lbl)
+        R.addLayout(zh); R.addWidget(self._sep())
+
+        # Rotation
+        R.addWidget(QLabel("Rotation  (Ctrl+Q / Ctrl+E, 2\u00b0)"))
+        rh = QHBoxLayout()
+        self.rot_slider = QSlider(Qt.Horizontal); self.rot_slider.setRange(0,360); self.rot_slider.setValue(0)
+        self.rot_slider.valueChanged.connect(self._on_rot_slider); rh.addWidget(self.rot_slider)
+        self.rot_lbl = QLabel("0\u00b0"); self.rot_lbl.setFixedWidth(44)
+        self.rot_lbl.setAlignment(Qt.AlignRight|Qt.AlignVCenter); rh.addWidget(self.rot_lbl)
+        R.addLayout(rh)
+
+        xr = QHBoxLayout(); xr.setSpacing(6)
+        b = QPushButton("\u21b6  -90\u00b0"); b.clicked.connect(lambda: self._rot_by(-90)); xr.addWidget(b)
+        b = QPushButton("+90\u00b0  \u21b7"); b.clicked.connect(lambda: self._rot_by(90)); xr.addWidget(b)
+        b = QPushButton("0\u00b0"); b.setFixedWidth(42); b.clicked.connect(self._rot_reset); xr.addWidget(b)
+        self.fh_btn = QPushButton("\u2194  Flip H"); self.fh_btn.setCheckable(True); self.fh_btn.clicked.connect(self._flip_h); xr.addWidget(self.fh_btn)
+        self.fv_btn = QPushButton("\u2195  Flip V"); self.fv_btn.setCheckable(True); self.fv_btn.clicked.connect(self._flip_v); xr.addWidget(self.fv_btn)
+        R.addLayout(xr)
+        R.addWidget(self._lbl("Drag rotation handle on overlay to rotate freely", "#999", 10, Qt.AlignCenter))
+        R.addWidget(self._sep())
+
+        # Size
+        R.addWidget(QLabel("Overlay Size"))
+        self.lock_cb = QCheckBox("Lock aspect ratio  (Ctrl+L)")
+        self.lock_cb.setChecked(True); self.lock_cb.toggled.connect(self._on_lock_toggled); R.addWidget(self.lock_cb)
+        sh = QHBoxLayout(); sh.setSpacing(6)
+        self.w_spin = self._spin(800); self.w_spin.valueChanged.connect(self._on_w); self.w_spin.editingFinished.connect(self._apply_size)
+        sh.addWidget(self.w_spin); sh.addWidget(QLabel("\u00d7"))
+        self.h_spin = self._spin(600); self.h_spin.valueChanged.connect(self._on_h); self.h_spin.editingFinished.connect(self._apply_size)
+        sh.addWidget(self.h_spin)
+        ab = QPushButton("Apply"); ab.setFixedWidth(60); ab.clicked.connect(self._apply_size); sh.addWidget(ab)
+        R.addLayout(sh)
+
+        self.reset_btn = QPushButton("Reset All  (Ctrl+F)")
+        self.reset_btn.clicked.connect(self._reset_all); self.reset_btn.setEnabled(False); R.addWidget(self.reset_btn)
+        R.addWidget(self._sep())
+
+        # Shortcuts reference
+        sc = (
+            "Ctrl+O              Open image\n"
+            "Ctrl+T              Toggle click-through\n"
+            "Ctrl+H              Hide / show overlay\n"
+            "Ctrl+A / D           Opacity down / up\n"
+            "Ctrl+S              Edge detection\n"
+            "Ctrl+Scroll          Zoom at cursor\n"
+            "Ctrl+Q / E           Rotate CCW / CW 2\u00b0\n"
+            "Ctrl+W              Reset rotation\n"
+            "Ctrl+Shift+H / V     Flip H / V\n"
+            "Ctrl+L              Lock aspect ratio\n"
+            "Ctrl+F              Reset all\n"
+            "\u2190\u2191\u2192\u2193 / Shift+\u2190\u2191\u2192\u2193    Nudge 1 / 20 px"
         )
-        self.open_btn.clicked.connect(self._open_image)
-        root.addWidget(self.open_btn)
+        sl = QLabel(sc); sl.setStyleSheet("color:#888; font-size:10px; font-family:'Consolas','Courier New',monospace;")
+        R.addWidget(sl)
+        R.addStretch()
+        R.addWidget(self._lbl(f"v{VERSION}  \u00b7  Closing this panel closes the overlay", "#aaa", 10, Qt.AlignCenter))
+        self.setLayout(R)
 
-        self.file_label = QLabel("No image loaded  (or drag && drop here)")
-        self.file_label.setStyleSheet("color: gray; font-size: 11px;")
-        self.file_label.setWordWrap(True)
-        root.addWidget(self.file_label)
+    # ── helpers ──────────────────────────────────────────────
+    @staticmethod
+    def _sep():
+        f = QFrame(); f.setFrameShape(QFrame.HLine); f.setStyleSheet("color:#e0e0e0;"); return f
 
-        root.addWidget(self._sep())
+    @staticmethod
+    def _lbl(txt, color, size, align=None):
+        l = QLabel(txt); l.setStyleSheet(f"color:{color}; font-size:{size}px;")
+        if align: l.setAlignment(align)
+        return l
 
-        # ── Opacity ──
-        root.addWidget(QLabel("Opacity  (Ctrl+[ / Ctrl+])"))
-        row = QHBoxLayout()
-        self.opacity_slider = QSlider(Qt.Horizontal)
-        self.opacity_slider.setRange(5, 100)
-        self.opacity_slider.setValue(50)
-        self.opacity_slider.valueChanged.connect(self._on_opacity)
-        row.addWidget(self.opacity_slider)
-        self.opacity_label = QLabel("50%")
-        self.opacity_label.setFixedWidth(38)
-        self.opacity_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        row.addWidget(self.opacity_label)
-        root.addLayout(row)
+    @staticmethod
+    def _spin(val):
+        s = QSpinBox(); s.setRange(100,4000); s.setValue(val); s.setSuffix("  px"); return s
 
-        root.addWidget(self._sep())
-
-        # ── Click-through toggle ──
-        self.lock_btn = QPushButton("Enable Click-Through  (Ctrl+T)")
-        self.lock_btn.setCheckable(True)
-        self.lock_btn.toggled.connect(self._toggle_click_through)
-        root.addWidget(self.lock_btn)
-
-        info = QLabel(
-            "ON: clicks pass through to the app below\n"
-            "OFF: drag to move / resize the overlay"
-        )
-        info.setStyleSheet("color: #999; font-size: 10px;")
-        root.addWidget(info)
-
-        root.addWidget(self._sep())
-
-        # ── Rotation slider ──
-        root.addWidget(QLabel("Rotation  (Ctrl+R / Ctrl+Shift+R, 2\u00b0 step)"))
-        rot_row = QHBoxLayout()
-        self.rot_slider = QSlider(Qt.Horizontal)
-        self.rot_slider.setRange(0, 359)
-        self.rot_slider.setValue(0)
-        self.rot_slider.valueChanged.connect(self._on_rotation_slider)
-        rot_row.addWidget(self.rot_slider)
-        self.rot_label = QLabel("0\u00b0")
-        self.rot_label.setFixedWidth(38)
-        self.rot_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        rot_row.addWidget(self.rot_label)
-        root.addLayout(rot_row)
-
-        # Quick rotate + flip buttons
-        xform_row = QHBoxLayout()
-        xform_row.setSpacing(4)
-
-        self.rot_ccw_btn = QPushButton("\u21b6 -90\u00b0")
-        self.rot_ccw_btn.setToolTip("Rotate counter-clockwise 90\u00b0")
-        self.rot_ccw_btn.clicked.connect(lambda: self._rotate_by(-90))
-        xform_row.addWidget(self.rot_ccw_btn)
-
-        self.rot_cw_btn = QPushButton("+90\u00b0 \u21b7")
-        self.rot_cw_btn.setToolTip("Rotate clockwise 90\u00b0")
-        self.rot_cw_btn.clicked.connect(lambda: self._rotate_by(90))
-        xform_row.addWidget(self.rot_cw_btn)
-
-        self.rot_reset_btn = QPushButton("0\u00b0")
-        self.rot_reset_btn.setToolTip("Reset rotation")
-        self.rot_reset_btn.clicked.connect(self._reset_rotation)
-        self.rot_reset_btn.setFixedWidth(36)
-        xform_row.addWidget(self.rot_reset_btn)
-
-        self.flip_h_btn = QPushButton("\u2194 Flip H")
-        self.flip_h_btn.setToolTip("Flip horizontal (Ctrl+Shift+H)")
-        self.flip_h_btn.setCheckable(True)
-        self.flip_h_btn.clicked.connect(self._flip_h)
-        xform_row.addWidget(self.flip_h_btn)
-
-        self.flip_v_btn = QPushButton("\u2195 Flip V")
-        self.flip_v_btn.setToolTip("Flip vertical (Ctrl+Shift+V)")
-        self.flip_v_btn.setCheckable(True)
-        self.flip_v_btn.clicked.connect(self._flip_v)
-        xform_row.addWidget(self.flip_v_btn)
-
-        root.addLayout(xform_row)
-
-        root.addWidget(self._sep())
-
-        # ── Size controls ──
-        root.addWidget(QLabel("Overlay Size"))
-
-        self.lock_aspect_cb = QCheckBox("Lock aspect ratio  (Ctrl+L)")
-        self.lock_aspect_cb.setChecked(True)
-        self.lock_aspect_cb.setStyleSheet("font-size: 11px;")
-        self.lock_aspect_cb.toggled.connect(self._on_lock_aspect_toggled)
-        root.addWidget(self.lock_aspect_cb)
-
-        size_row = QHBoxLayout()
-        self.w_spin = QSpinBox()
-        self.w_spin.setRange(100, 4000)
-        self.w_spin.setValue(800)
-        self.w_spin.setSuffix(" px")
-        self.w_spin.valueChanged.connect(self._on_w_changed)
-        size_row.addWidget(self.w_spin)
-        size_row.addWidget(QLabel("\u00d7"))
-        self.h_spin = QSpinBox()
-        self.h_spin.setRange(100, 4000)
-        self.h_spin.setValue(600)
-        self.h_spin.setSuffix(" px")
-        self.h_spin.valueChanged.connect(self._on_h_changed)
-        size_row.addWidget(self.h_spin)
-        apply_btn = QPushButton("Apply")
-        apply_btn.setFixedWidth(50)
-        apply_btn.clicked.connect(self._apply_size)
-        size_row.addWidget(apply_btn)
-        root.addLayout(size_row)
-
-        self.fit_btn = QPushButton("Fit to Original Image Size  (Ctrl+F)")
-        self.fit_btn.clicked.connect(self._fit_to_image)
-        self.fit_btn.setEnabled(False)
-        root.addWidget(self.fit_btn)
-
-        root.addWidget(self._sep())
-
-        # ── Shortcut reference ──
-        shortcuts_text = (
-            "Ctrl+O          Open image\n"
-            "Ctrl+T          Toggle click-through\n"
-            "Ctrl+H          Hide / show overlay\n"
-            "Ctrl+[ / ]      Opacity down / up\n"
-            "Ctrl+R          Rotate CW 2\u00b0\n"
-            "Ctrl+Shift+R    Rotate CCW 2\u00b0\n"
-            "Ctrl+Shift+H    Flip horizontal\n"
-            "Ctrl+Shift+V    Flip vertical\n"
-            "Ctrl+L          Lock aspect ratio\n"
-            "Ctrl+F          Fit to image size"
-        )
-        sc_label = QLabel(shortcuts_text)
-        sc_label.setStyleSheet(
-            "color: #888; font-size: 10px; font-family: 'Consolas', 'Courier New', monospace;"
-        )
-        root.addWidget(sc_label)
-
-        root.addStretch()
-
-        # ── Footer ──
-        footer = QLabel(f"v{VERSION}  \u00b7  Closing this panel closes the overlay")
-        footer.setStyleSheet("color: #aaa; font-size: 10px;")
-        footer.setAlignment(Qt.AlignCenter)
-        root.addWidget(footer)
-
-        self.setLayout(root)
-
+    # ── shortcuts ────────────────────────────────────────────
     def _setup_shortcuts(self):
-        """Register keyboard shortcuts on BOTH the control panel and the overlay."""
-        bindings = {
+        B = {
             "Ctrl+O": self._open_image,
-            "Ctrl+T": lambda: self.lock_btn.toggle(),
-            "Ctrl+H": self._toggle_overlay_visible,
-            "Ctrl+[": self._opacity_down,
-            "Ctrl+]": self._opacity_up,
-            "Ctrl+F": self._fit_to_image,
-            "Ctrl+R": lambda: self._rotate_by(ROTATION_STEP),
-            "Ctrl+Shift+R": lambda: self._rotate_by(-ROTATION_STEP),
-            "Ctrl+Shift+H": self._flip_h,
-            "Ctrl+Shift+V": self._flip_v,
-            "Ctrl+L": self._toggle_lock_aspect,
+            "Ctrl+T": lambda: self.ct_btn.toggle(),
+            "Ctrl+H": self._toggle_vis,
+            "Ctrl+A": self._opa_dn, "Ctrl+D": self._opa_up,
+            "Ctrl+S": lambda: self.edge_btn.toggle() if self.edge_btn.isEnabled() else None,
+            "Ctrl+Q": lambda: self._rot_by(-ROTATION_STEP),
+            "Ctrl+E": lambda: self._rot_by(ROTATION_STEP),
+            "Ctrl+W": self._rot_reset,
+            "Ctrl+Shift+H": self._flip_h, "Ctrl+Shift+V": self._flip_v,
+            "Ctrl+L": lambda: self.lock_cb.setChecked(not self.lock_cb.isChecked()),
+            "Ctrl+F": self._reset_all,
         }
-        for key, slot in bindings.items():
-            # Register on control panel
-            QShortcut(QKeySequence(key), self).activated.connect(slot)
-            # Register on overlay window too
-            QShortcut(QKeySequence(key), self.overlay).activated.connect(slot)
+        for k, fn in B.items():
+            QShortcut(QKeySequence(k), self).activated.connect(fn)
+            QShortcut(QKeySequence(k), self.overlay).activated.connect(fn)
 
-    # ── Settings persistence ─────────────────────────────────
-    def _restore_settings(self):
+    # ── settings ─────────────────────────────────────────────
+    def _restore(self):
         s = self._settings
         self.move(s["panel_x"], s["panel_y"])
         self.overlay.move(s["overlay_x"], s["overlay_y"])
         self.overlay.resize(s["overlay_w"], s["overlay_h"])
-        self._updating_spin = True
-        self.w_spin.setValue(s["overlay_w"])
-        self.h_spin.setValue(s["overlay_h"])
-        self._updating_spin = False
-        self.opacity_slider.setValue(s["opacity"])
-        self.lock_aspect_cb.setChecked(s.get("lock_aspect", True))
-        self._aspect_ratio = s["overlay_w"] / max(1, s["overlay_h"])
-        self._sync_aspect_to_overlay()
+        self._spin_lock = True
+        self.w_spin.setValue(s["overlay_w"]); self.h_spin.setValue(s["overlay_h"])
+        self._spin_lock = False
+        self.opa_slider.setValue(s["opacity"])
+        self.zoom_slider.setValue(s.get("zoom", 100))
+        self.lock_cb.setChecked(s.get("lock_aspect", True))
+        self._ar = s["overlay_w"] / max(1, s["overlay_h"])
+        self._sync_aspect()
 
-        # Restore last image if it still exists
         last = s.get("last_image", "")
         if last and os.path.isfile(last):
             self._load_image(last)
-            # Restore transform after image is loaded
-            rot = s.get("rotation", 0)
-            fh = s.get("flip_h", False)
-            fv = s.get("flip_v", False)
-            self.overlay.set_transform(rot, fh, fv)
-            self.rot_slider.setValue(int(rot) % 360)
-            self.flip_h_btn.setChecked(fh)
-            self.flip_v_btn.setChecked(fv)
-            self._update_rot_label()
+            self.overlay.set_transform(s.get("rotation",0), s.get("flip_h",False), s.get("flip_v",False))
+            self.rot_slider.setValue(int(s.get("rotation",0)) % 361)
+            self.fh_btn.setChecked(s.get("flip_h",False)); self.fv_btn.setChecked(s.get("flip_v",False))
+            self._update_rot_lbl()
+            if s.get("edge_detect",False) and HAS_PILLOW: self.edge_btn.setChecked(True)
 
-    def _save_settings(self):
-        pos = self.pos()
-        opos = self.overlay.pos()
-        data = {
-            "panel_x": pos.x(),
-            "panel_y": pos.y(),
-            "overlay_x": opos.x(),
-            "overlay_y": opos.y(),
-            "overlay_w": self.overlay.width(),
-            "overlay_h": self.overlay.height(),
-            "opacity": self.opacity_slider.value(),
-            "last_image": self._current_image_path,
-            "rotation": self.overlay.rotation,
-            "flip_h": self.overlay.flip_h,
-            "flip_v": self.overlay.flip_v,
-            "lock_aspect": self.lock_aspect_cb.isChecked(),
-        }
-        save_settings(data)
+    def _save(self):
+        p, op = self.pos(), self.overlay.pos()
+        save_settings({
+            "panel_x":p.x(),"panel_y":p.y(),"overlay_x":op.x(),"overlay_y":op.y(),
+            "overlay_w":self.overlay.width(),"overlay_h":self.overlay.height(),
+            "opacity":self.opa_slider.value(), "zoom":self.zoom_slider.value(),
+            "last_image":self._img_path, "rotation":self.overlay.rotation,
+            "flip_h":self.overlay.flip_h, "flip_v":self.overlay.flip_v,
+            "lock_aspect":self.lock_cb.isChecked(), "edge_detect":self._edge_mode,
+        })
 
-    @staticmethod
-    def _sep() -> QFrame:
-        line = QFrame()
-        line.setFrameShape(QFrame.HLine)
-        line.setStyleSheet("color: #e0e0e0;")
-        return line
+    # ── image ────────────────────────────────────────────────
+    def _load_image(self, path):
+        pm = QPixmap(path)
+        if pm.isNull(): QMessageBox.warning(self,"Error","Could not load."); return
+        self._img_path = path; self._orig_img = pm; self._edge_img = None
+        self._edge_mode = False; self.edge_btn.setChecked(False)
+        self.overlay.set_image(pm)
+        self.overlay.pan_x = self.overlay.pan_y = 0.0
+        self.overlay.zoom = 1.0; self.zoom_slider.setValue(100)
 
-    # ── Image loading (shared by open, drop, and restore) ────
-    def _load_image(self, path: str):
-        pixmap = QPixmap(path)
-        if pixmap.isNull():
-            QMessageBox.warning(self, "Error", "Could not load this image.")
-            return
-
-        self._current_image_path = path
-        self.overlay.set_image(pixmap)
-
-        # Constrain to screen size
-        screen = QApplication.primaryScreen().availableGeometry()
-        w = min(pixmap.width(), screen.width() - 50)
-        h = min(pixmap.height(), screen.height() - 50)
+        sc = QApplication.primaryScreen().availableGeometry()
+        w = min(pm.width(), sc.width()-50); h = min(pm.height(), sc.height()-50)
         self.overlay.resize(w, h)
-        self._updating_spin = True
-        self.w_spin.setValue(w)
-        self.h_spin.setValue(h)
-        self._updating_spin = False
-
-        self.overlay.show()
-        self.fit_btn.setEnabled(True)
-
-        # Set aspect ratio from image
-        self._aspect_ratio = pixmap.width() / max(1, pixmap.height())
-        self._sync_aspect_to_overlay()
-
-        # Reset transform for new image
+        self._spin_lock = True; self.w_spin.setValue(w); self.h_spin.setValue(h); self._spin_lock = False
+        self.overlay.show(); self.reset_btn.setEnabled(True)
+        self._ar = w / max(1, h); self._sync_aspect()
         self.overlay.set_transform(0, False, False)
-        self.rot_slider.setValue(0)
-        self.flip_h_btn.setChecked(False)
-        self.flip_v_btn.setChecked(False)
-        self._update_rot_label()
+        self.rot_slider.setValue(0); self.fh_btn.setChecked(False); self.fv_btn.setChecked(False)
+        self._update_rot_lbl()
+        self.file_label.setText(f"{os.path.basename(path)}  ({pm.width()} \u00d7 {pm.height()} px)")
 
-        name = os.path.basename(path)
-        self.file_label.setText(f"{name}  ({pixmap.width()} \u00d7 {pixmap.height()} px)")
-
-    # ── Slots ─────────────────────────────────────────────────
+    # ── slots ────────────────────────────────────────────────
     def _open_image(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open Image",
-            "",
-            "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tiff);;All Files (*)",
-        )
-        if path:
-            self._load_image(path)
+        p, _ = QFileDialog.getOpenFileName(self, "Open Image", "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tiff);;All Files (*)")
+        if p: self._load_image(p)
 
-    def _on_opacity(self, value: int):
-        self.opacity_label.setText(f"{value}%")
-        self.overlay.set_opacity(value / 100.0)
+    def _on_opacity(self, v): self.opa_lbl.setText(f"{v}%"); self.overlay.set_opacity(v/100.)
+    def _opa_dn(self): self.opa_slider.setValue(max(5, self.opa_slider.value()-OPACITY_STEP))
+    def _opa_up(self): self.opa_slider.setValue(min(100, self.opa_slider.value()+OPACITY_STEP))
 
-    def _opacity_down(self):
-        self.opacity_slider.setValue(max(5, self.opacity_slider.value() - OPACITY_STEP))
+    def _toggle_ct(self, on):
+        self.overlay.set_click_through(on)
+        self.ct_btn.setText(("Disable" if on else "Enable")+"  Click-Through  (Ctrl+T)")
 
-    def _opacity_up(self):
-        self.opacity_slider.setValue(min(100, self.opacity_slider.value() + OPACITY_STEP))
+    def _toggle_vis(self):
+        self.overlay.hide() if self.overlay.isVisible() else self.overlay.show()
 
-    def _toggle_click_through(self, checked: bool):
-        self.overlay.set_click_through(checked)
-        if checked:
-            self.lock_btn.setText("Disable Click-Through  (Ctrl+T)")
+    def _toggle_edge(self, on):
+        if not self._orig_img: return
+        self._edge_mode = on
+        if on:
+            if not self._edge_img: self._edge_img = apply_edge_detection(self._orig_img)
+            self.overlay.set_image(self._edge_img)
         else:
-            self.lock_btn.setText("Enable Click-Through  (Ctrl+T)")
+            self.overlay.set_image(self._orig_img)
 
-    def _toggle_overlay_visible(self):
-        if self.overlay.isVisible():
-            self.overlay.hide()
-        else:
-            self.overlay.show()
+    # zoom
+    def _on_zoom_slider(self, v):
+        self.zoom_lbl.setText(f"{v}%")
+        self.overlay.pan_x = self.overlay.pan_y = 0.0  # center zoom from slider
+        self.overlay.set_zoom(v / 100.)
 
-    # ── Rotation ─────────────────────────────────────────────
-    def _on_rotation_slider(self, value: int):
-        self.overlay.set_rotation(float(value))
-        self._update_rot_label()
+    def _sync_zoom_from_overlay(self):
+        v = int(self.overlay.zoom * 100)
+        self.zoom_slider.blockSignals(True); self.zoom_slider.setValue(v); self.zoom_slider.blockSignals(False)
+        self.zoom_lbl.setText(f"{v}%")
 
-    def _rotate_by(self, delta: float):
-        new_rot = (self.overlay.rotation + delta) % 360
-        self.rot_slider.setValue(int(new_rot))
-        # set_rotation is called via slider's valueChanged signal
+    # rotation
+    def _on_rot_slider(self, v):
+        self.overlay.set_rotation(float(v % 360)); self._update_rot_lbl()
 
-    def _reset_rotation(self):
-        self.rot_slider.setValue(0)
+    def _rot_by(self, d):
+        nr = (self.overlay.rotation + d) % 360; self.rot_slider.setValue(int(nr))
 
-    def _flip_h(self):
-        self.overlay.flip_horizontal()
-        self.flip_h_btn.setChecked(self.overlay.flip_h)
-        self._update_rot_label()
+    def _rot_reset(self): self.rot_slider.setValue(0)
 
-    def _flip_v(self):
-        self.overlay.flip_vertical()
-        self.flip_v_btn.setChecked(self.overlay.flip_v)
-        self._update_rot_label()
+    def _sync_rotation_from_overlay(self):
+        d = int(self.overlay.rotation)
+        self.rot_slider.blockSignals(True); self.rot_slider.setValue(d); self.rot_slider.blockSignals(False)
+        self._update_rot_lbl()
 
-    def _update_rot_label(self):
-        deg = int(self.overlay.rotation)
-        self.rot_label.setText(f"{deg}\u00b0")
+    def _flip_h(self): self.overlay.flip_horizontal(); self.fh_btn.setChecked(self.overlay.flip_h)
+    def _flip_v(self): self.overlay.flip_vertical(); self.fv_btn.setChecked(self.overlay.flip_v)
+    def _update_rot_lbl(self): self.rot_lbl.setText(f"{int(self.overlay.rotation)}\u00b0")
 
+    # size
     def _apply_size(self):
         self.overlay.resize(self.w_spin.value(), self.h_spin.value())
-        self._aspect_ratio = self.w_spin.value() / max(1, self.h_spin.value())
-        self._sync_aspect_to_overlay()
+        self._ar = self.w_spin.value() / max(1, self.h_spin.value())
+        self._sync_aspect()
 
-    def _on_lock_aspect_toggled(self, checked: bool):
-        if checked:
-            self._aspect_ratio = self.w_spin.value() / max(1, self.h_spin.value())
-        self._sync_aspect_to_overlay()
+    def _on_w(self, v):
+        if self._spin_lock: return
+        if self.lock_cb.isChecked() and self._ar > 0:
+            self._spin_lock = True; self.h_spin.setValue(max(100, int(v/self._ar))); self._spin_lock = False
 
-    def _on_w_changed(self, value: int):
-        if self._updating_spin:
-            return
-        if self.lock_aspect_cb.isChecked() and self._aspect_ratio > 0:
-            self._updating_spin = True
-            self.h_spin.setValue(max(100, int(value / self._aspect_ratio)))
-            self._updating_spin = False
+    def _on_h(self, v):
+        if self._spin_lock: return
+        if self.lock_cb.isChecked() and self._ar > 0:
+            self._spin_lock = True; self.w_spin.setValue(max(100, int(v*self._ar))); self._spin_lock = False
 
-    def _on_h_changed(self, value: int):
-        if self._updating_spin:
-            return
-        if self.lock_aspect_cb.isChecked() and self._aspect_ratio > 0:
-            self._updating_spin = True
-            self.w_spin.setValue(max(100, int(value * self._aspect_ratio)))
-            self._updating_spin = False
+    def _on_lock_toggled(self, on):
+        if on: self._ar = self.w_spin.value() / max(1, self.h_spin.value())
+        self._sync_aspect()
 
-    def _toggle_lock_aspect(self):
-        self.lock_aspect_cb.setChecked(not self.lock_aspect_cb.isChecked())
-        # Refresh aspect ratio from current values when locking
-        if self.lock_aspect_cb.isChecked():
-            self._aspect_ratio = self.w_spin.value() / max(1, self.h_spin.value())
-        self._sync_aspect_to_overlay()
+    def _sync_aspect(self):
+        self.overlay.lock_aspect = self.lock_cb.isChecked()
+        self.overlay.aspect_ratio = self._ar
 
-    def _sync_aspect_to_overlay(self):
-        """Keep overlay's aspect lock state in sync with the checkbox."""
-        self.overlay.lock_aspect = self.lock_aspect_cb.isChecked()
-        self.overlay.aspect_ratio = self._aspect_ratio
+    # reset
+    def _reset_all(self):
+        if not self.overlay.image: return
+        self.overlay.set_transform(0, False, False)
+        self.rot_slider.setValue(0); self.fh_btn.setChecked(False); self.fv_btn.setChecked(False)
+        self._update_rot_lbl()
+        self.overlay.pan_x = self.overlay.pan_y = 0.0
+        self.overlay.zoom = 1.0; self.zoom_slider.setValue(100)
 
-    def _fit_to_image(self):
-        if self.overlay.image:
-            screen = QApplication.primaryScreen().availableGeometry()
-            w = min(self.overlay.image.width(), screen.width() - 50)
-            h = min(self.overlay.image.height(), screen.height() - 50)
-            self.overlay.resize(w, h)
-            self._updating_spin = True
-            self.w_spin.setValue(w)
-            self.h_spin.setValue(h)
-            self._updating_spin = False
-            self._aspect_ratio = w / max(1, h)
-            self._sync_aspect_to_overlay()
+        img = self._orig_img or self.overlay.image
+        sc = QApplication.primaryScreen().availableGeometry()
+        w = min(img.width(), sc.width()-50); h = min(img.height(), sc.height()-50)
+        self.overlay.resize(w, h)
+        self._spin_lock = True; self.w_spin.setValue(w); self.h_spin.setValue(h); self._spin_lock = False
+        self._ar = w / max(1, h); self._sync_aspect()
+        self.overlay.move(sc.x()+(sc.width()-w)//2, sc.y()+(sc.height()-h)//2)
 
-    def closeEvent(self, event):
-        self._save_settings()
-        self.overlay.close()
-        event.accept()
+    def closeEvent(self, ev):
+        self._save(); self.overlay.close(); ev.accept()
 
 
-# ── Entry point ───────────────────────────────────────────────
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-
-    panel = ControlPanel()
-    panel.show()
-
+    ControlPanel().show()
     sys.exit(app.exec_())
-
 
 if __name__ == "__main__":
     main()
