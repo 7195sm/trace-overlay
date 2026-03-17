@@ -18,7 +18,7 @@ import ctypes
 import json
 from pathlib import Path
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QLabel, QPushButton, QSlider, QSpinBox,
+    QApplication, QWidget, QLabel, QPushButton, QSlider, QSpinBox, QCheckBox,
     QVBoxLayout, QHBoxLayout, QFrame, QFileDialog, QMessageBox, QShortcut,
 )
 from PyQt5.QtCore import Qt, QPoint, QRect, QUrl
@@ -34,9 +34,10 @@ WS_EX_TRANSPARENT = 0x00000020
 
 EDGE_MARGIN = 8       # px — resize handle detection zone
 OPACITY_STEP = 5      # % per keyboard shortcut press
+ROTATION_STEP = 2     # degrees per keyboard shortcut press
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tiff"}
 
-VERSION = "1.2.0"
+VERSION = "1.4.0"
 
 # ── Settings persistence ─────────────────────────────────────
 SETTINGS_DIR = Path(os.environ.get("APPDATA", Path.home())) / "TraceOverlay"
@@ -54,6 +55,7 @@ DEFAULT_SETTINGS = {
     "rotation": 0,
     "flip_h": False,
     "flip_v": False,
+    "lock_aspect": True,
 }
 
 
@@ -62,7 +64,6 @@ def load_settings() -> dict:
         if SETTINGS_FILE.exists():
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                 saved = json.load(f)
-            # Merge with defaults so new keys are always present
             return {**DEFAULT_SETTINGS, **saved}
     except Exception:
         pass
@@ -86,7 +87,7 @@ class OverlayWindow(QWidget):
         self.image: QPixmap | None = None
         self._display_image: QPixmap | None = None  # transformed cache
         self.opacity_value: float = 0.5
-        self._rotation: int = 0          # 0, 90, 180, 270
+        self._rotation: float = 0.0       # 0.0 – 359.9
         self._flip_h: bool = False
         self._flip_v: bool = False
         self._click_through: bool = False
@@ -95,6 +96,8 @@ class OverlayWindow(QWidget):
         self._drag_start: QPoint = QPoint()
         self._resize_edge: str = ""
         self._start_geometry: QRect = QRect()
+        self.lock_aspect: bool = True
+        self.aspect_ratio: float = 800 / 600
 
         self.setWindowTitle("Trace Overlay")
         self.setWindowFlags(
@@ -132,13 +135,12 @@ class OverlayWindow(QWidget):
         self.update()
 
     # ── Rotation & Flip ──────────────────────────────────────
-    def rotate_cw(self):
-        self._rotation = (self._rotation + 90) % 360
+    def set_rotation(self, degrees: float):
+        self._rotation = degrees % 360
         self._rebuild_display()
 
-    def rotate_ccw(self):
-        self._rotation = (self._rotation - 90) % 360
-        self._rebuild_display()
+    def rotate_by(self, delta: float):
+        self.set_rotation(self._rotation + delta)
 
     def flip_horizontal(self):
         self._flip_h = not self._flip_h
@@ -148,7 +150,7 @@ class OverlayWindow(QWidget):
         self._flip_v = not self._flip_v
         self._rebuild_display()
 
-    def set_transform(self, rotation: int, flip_h: bool, flip_v: bool):
+    def set_transform(self, rotation: float, flip_h: bool, flip_v: bool):
         """Restore transform state (e.g. from saved settings)."""
         self._rotation = rotation % 360
         self._flip_h = flip_h
@@ -157,7 +159,7 @@ class OverlayWindow(QWidget):
             self._rebuild_display()
 
     @property
-    def rotation(self) -> int:
+    def rotation(self) -> float:
         return self._rotation
 
     @property
@@ -280,6 +282,21 @@ class OverlayWindow(QWidget):
             if g.bottom() - new_top >= min_h:
                 g.setTop(new_top)
 
+        # Apply aspect ratio constraint
+        if self.lock_aspect and self.aspect_ratio > 0:
+            edge = self._resize_edge
+            has_h = ("l" in edge or "r" in edge)
+            has_v = ("t" in edge or "b" in edge)
+            if has_h and not has_v:
+                # Width changed — adjust height
+                g.setHeight(max(min_h, int(g.width() / self.aspect_ratio)))
+            elif has_v and not has_h:
+                # Height changed — adjust width
+                g.setWidth(max(min_w, int(g.height() * self.aspect_ratio)))
+            elif has_h and has_v:
+                # Corner drag — width leads
+                g.setHeight(max(min_h, int(g.width() / self.aspect_ratio)))
+
         self.setGeometry(g)
 
 
@@ -326,6 +343,8 @@ class ControlPanel(QWidget):
         super().__init__()
         self.overlay = OverlayWindow()
         self._current_image_path: str = ""
+        self._aspect_ratio: float = 800 / 600  # w / h
+        self._updating_spin: bool = False       # guard against recursive spin updates
         self._settings = load_settings()
         self._build_ui()
         self._setup_shortcuts()
@@ -422,20 +441,39 @@ class ControlPanel(QWidget):
 
         root.addWidget(self._sep())
 
-        # ── Transform (rotation & flip) ──
-        root.addWidget(QLabel("Transform"))
+        # ── Rotation slider ──
+        root.addWidget(QLabel("Rotation  (Ctrl+R / Ctrl+Shift+R, 2\u00b0 step)"))
+        rot_row = QHBoxLayout()
+        self.rot_slider = QSlider(Qt.Horizontal)
+        self.rot_slider.setRange(0, 359)
+        self.rot_slider.setValue(0)
+        self.rot_slider.valueChanged.connect(self._on_rotation_slider)
+        rot_row.addWidget(self.rot_slider)
+        self.rot_label = QLabel("0\u00b0")
+        self.rot_label.setFixedWidth(38)
+        self.rot_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        rot_row.addWidget(self.rot_label)
+        root.addLayout(rot_row)
+
+        # Quick rotate + flip buttons
         xform_row = QHBoxLayout()
         xform_row.setSpacing(4)
 
-        self.rot_ccw_btn = QPushButton("\u21b6 CCW")
-        self.rot_ccw_btn.setToolTip("Rotate counter-clockwise (Ctrl+Shift+R)")
-        self.rot_ccw_btn.clicked.connect(self._rotate_ccw)
+        self.rot_ccw_btn = QPushButton("\u21b6 -90\u00b0")
+        self.rot_ccw_btn.setToolTip("Rotate counter-clockwise 90\u00b0")
+        self.rot_ccw_btn.clicked.connect(lambda: self._rotate_by(-90))
         xform_row.addWidget(self.rot_ccw_btn)
 
-        self.rot_cw_btn = QPushButton("CW \u21b7")
-        self.rot_cw_btn.setToolTip("Rotate clockwise (Ctrl+R)")
-        self.rot_cw_btn.clicked.connect(self._rotate_cw)
+        self.rot_cw_btn = QPushButton("+90\u00b0 \u21b7")
+        self.rot_cw_btn.setToolTip("Rotate clockwise 90\u00b0")
+        self.rot_cw_btn.clicked.connect(lambda: self._rotate_by(90))
         xform_row.addWidget(self.rot_cw_btn)
+
+        self.rot_reset_btn = QPushButton("0\u00b0")
+        self.rot_reset_btn.setToolTip("Reset rotation")
+        self.rot_reset_btn.clicked.connect(self._reset_rotation)
+        self.rot_reset_btn.setFixedWidth(36)
+        xform_row.addWidget(self.rot_reset_btn)
 
         self.flip_h_btn = QPushButton("\u2194 Flip H")
         self.flip_h_btn.setToolTip("Flip horizontal (Ctrl+Shift+H)")
@@ -451,26 +489,30 @@ class ControlPanel(QWidget):
 
         root.addLayout(xform_row)
 
-        self.rot_label = QLabel("0\u00b0")
-        self.rot_label.setStyleSheet("color: #999; font-size: 10px;")
-        self.rot_label.setAlignment(Qt.AlignCenter)
-        root.addWidget(self.rot_label)
-
         root.addWidget(self._sep())
 
         # ── Size controls ──
         root.addWidget(QLabel("Overlay Size"))
+
+        self.lock_aspect_cb = QCheckBox("Lock aspect ratio  (Ctrl+L)")
+        self.lock_aspect_cb.setChecked(True)
+        self.lock_aspect_cb.setStyleSheet("font-size: 11px;")
+        self.lock_aspect_cb.toggled.connect(self._on_lock_aspect_toggled)
+        root.addWidget(self.lock_aspect_cb)
+
         size_row = QHBoxLayout()
         self.w_spin = QSpinBox()
         self.w_spin.setRange(100, 4000)
         self.w_spin.setValue(800)
         self.w_spin.setSuffix(" px")
+        self.w_spin.valueChanged.connect(self._on_w_changed)
         size_row.addWidget(self.w_spin)
         size_row.addWidget(QLabel("\u00d7"))
         self.h_spin = QSpinBox()
         self.h_spin.setRange(100, 4000)
         self.h_spin.setValue(600)
         self.h_spin.setSuffix(" px")
+        self.h_spin.valueChanged.connect(self._on_h_changed)
         size_row.addWidget(self.h_spin)
         apply_btn = QPushButton("Apply")
         apply_btn.setFixedWidth(50)
@@ -491,10 +533,11 @@ class ControlPanel(QWidget):
             "Ctrl+T          Toggle click-through\n"
             "Ctrl+H          Hide / show overlay\n"
             "Ctrl+[ / ]      Opacity down / up\n"
-            "Ctrl+R          Rotate CW 90\u00b0\n"
-            "Ctrl+Shift+R    Rotate CCW 90\u00b0\n"
+            "Ctrl+R          Rotate CW 2\u00b0\n"
+            "Ctrl+Shift+R    Rotate CCW 2\u00b0\n"
             "Ctrl+Shift+H    Flip horizontal\n"
             "Ctrl+Shift+V    Flip vertical\n"
+            "Ctrl+L          Lock aspect ratio\n"
             "Ctrl+F          Fit to image size"
         )
         sc_label = QLabel(shortcuts_text)
@@ -514,21 +557,25 @@ class ControlPanel(QWidget):
         self.setLayout(root)
 
     def _setup_shortcuts(self):
-        """Register keyboard shortcuts on the control panel."""
-        QShortcut(QKeySequence("Ctrl+O"), self).activated.connect(self._open_image)
-        QShortcut(QKeySequence("Ctrl+T"), self).activated.connect(
-            lambda: self.lock_btn.toggle()
-        )
-        QShortcut(QKeySequence("Ctrl+H"), self).activated.connect(self._toggle_overlay_visible)
-        QShortcut(QKeySequence("Ctrl+["), self).activated.connect(self._opacity_down)
-        QShortcut(QKeySequence("Ctrl+]"), self).activated.connect(self._opacity_up)
-        QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(self._fit_to_image)
-
-        # Rotation & flip
-        QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(self._rotate_cw)
-        QShortcut(QKeySequence("Ctrl+Shift+R"), self).activated.connect(self._rotate_ccw)
-        QShortcut(QKeySequence("Ctrl+Shift+H"), self).activated.connect(self._flip_h)
-        QShortcut(QKeySequence("Ctrl+Shift+V"), self).activated.connect(self._flip_v)
+        """Register keyboard shortcuts on BOTH the control panel and the overlay."""
+        bindings = {
+            "Ctrl+O": self._open_image,
+            "Ctrl+T": lambda: self.lock_btn.toggle(),
+            "Ctrl+H": self._toggle_overlay_visible,
+            "Ctrl+[": self._opacity_down,
+            "Ctrl+]": self._opacity_up,
+            "Ctrl+F": self._fit_to_image,
+            "Ctrl+R": lambda: self._rotate_by(ROTATION_STEP),
+            "Ctrl+Shift+R": lambda: self._rotate_by(-ROTATION_STEP),
+            "Ctrl+Shift+H": self._flip_h,
+            "Ctrl+Shift+V": self._flip_v,
+            "Ctrl+L": self._toggle_lock_aspect,
+        }
+        for key, slot in bindings.items():
+            # Register on control panel
+            QShortcut(QKeySequence(key), self).activated.connect(slot)
+            # Register on overlay window too
+            QShortcut(QKeySequence(key), self.overlay).activated.connect(slot)
 
     # ── Settings persistence ─────────────────────────────────
     def _restore_settings(self):
@@ -536,22 +583,27 @@ class ControlPanel(QWidget):
         self.move(s["panel_x"], s["panel_y"])
         self.overlay.move(s["overlay_x"], s["overlay_y"])
         self.overlay.resize(s["overlay_w"], s["overlay_h"])
+        self._updating_spin = True
         self.w_spin.setValue(s["overlay_w"])
         self.h_spin.setValue(s["overlay_h"])
+        self._updating_spin = False
         self.opacity_slider.setValue(s["opacity"])
+        self.lock_aspect_cb.setChecked(s.get("lock_aspect", True))
+        self._aspect_ratio = s["overlay_w"] / max(1, s["overlay_h"])
+        self._sync_aspect_to_overlay()
 
         # Restore last image if it still exists
         last = s.get("last_image", "")
         if last and os.path.isfile(last):
             self._load_image(last)
             # Restore transform after image is loaded
-            self.overlay.set_transform(
-                s.get("rotation", 0),
-                s.get("flip_h", False),
-                s.get("flip_v", False),
-            )
-            self.flip_h_btn.setChecked(self.overlay.flip_h)
-            self.flip_v_btn.setChecked(self.overlay.flip_v)
+            rot = s.get("rotation", 0)
+            fh = s.get("flip_h", False)
+            fv = s.get("flip_v", False)
+            self.overlay.set_transform(rot, fh, fv)
+            self.rot_slider.setValue(int(rot) % 360)
+            self.flip_h_btn.setChecked(fh)
+            self.flip_v_btn.setChecked(fv)
             self._update_rot_label()
 
     def _save_settings(self):
@@ -569,6 +621,7 @@ class ControlPanel(QWidget):
             "rotation": self.overlay.rotation,
             "flip_h": self.overlay.flip_h,
             "flip_v": self.overlay.flip_v,
+            "lock_aspect": self.lock_aspect_cb.isChecked(),
         }
         save_settings(data)
 
@@ -594,14 +647,21 @@ class ControlPanel(QWidget):
         w = min(pixmap.width(), screen.width() - 50)
         h = min(pixmap.height(), screen.height() - 50)
         self.overlay.resize(w, h)
+        self._updating_spin = True
         self.w_spin.setValue(w)
         self.h_spin.setValue(h)
+        self._updating_spin = False
 
         self.overlay.show()
         self.fit_btn.setEnabled(True)
 
+        # Set aspect ratio from image
+        self._aspect_ratio = pixmap.width() / max(1, pixmap.height())
+        self._sync_aspect_to_overlay()
+
         # Reset transform for new image
         self.overlay.set_transform(0, False, False)
+        self.rot_slider.setValue(0)
         self.flip_h_btn.setChecked(False)
         self.flip_v_btn.setChecked(False)
         self._update_rot_label()
@@ -643,32 +703,70 @@ class ControlPanel(QWidget):
         else:
             self.overlay.show()
 
-    def _rotate_cw(self):
-        self.overlay.rotate_cw()
+    # ── Rotation ─────────────────────────────────────────────
+    def _on_rotation_slider(self, value: int):
+        self.overlay.set_rotation(float(value))
         self._update_rot_label()
 
-    def _rotate_ccw(self):
-        self.overlay.rotate_ccw()
-        self._update_rot_label()
+    def _rotate_by(self, delta: float):
+        new_rot = (self.overlay.rotation + delta) % 360
+        self.rot_slider.setValue(int(new_rot))
+        # set_rotation is called via slider's valueChanged signal
+
+    def _reset_rotation(self):
+        self.rot_slider.setValue(0)
 
     def _flip_h(self):
         self.overlay.flip_horizontal()
         self.flip_h_btn.setChecked(self.overlay.flip_h)
+        self._update_rot_label()
 
     def _flip_v(self):
         self.overlay.flip_vertical()
         self.flip_v_btn.setChecked(self.overlay.flip_v)
+        self._update_rot_label()
 
     def _update_rot_label(self):
-        parts = [f"{self.overlay.rotation}\u00b0"]
-        if self.overlay.flip_h:
-            parts.append("H-flip")
-        if self.overlay.flip_v:
-            parts.append("V-flip")
-        self.rot_label.setText("  |  ".join(parts))
+        deg = int(self.overlay.rotation)
+        self.rot_label.setText(f"{deg}\u00b0")
 
     def _apply_size(self):
         self.overlay.resize(self.w_spin.value(), self.h_spin.value())
+        self._aspect_ratio = self.w_spin.value() / max(1, self.h_spin.value())
+        self._sync_aspect_to_overlay()
+
+    def _on_lock_aspect_toggled(self, checked: bool):
+        if checked:
+            self._aspect_ratio = self.w_spin.value() / max(1, self.h_spin.value())
+        self._sync_aspect_to_overlay()
+
+    def _on_w_changed(self, value: int):
+        if self._updating_spin:
+            return
+        if self.lock_aspect_cb.isChecked() and self._aspect_ratio > 0:
+            self._updating_spin = True
+            self.h_spin.setValue(max(100, int(value / self._aspect_ratio)))
+            self._updating_spin = False
+
+    def _on_h_changed(self, value: int):
+        if self._updating_spin:
+            return
+        if self.lock_aspect_cb.isChecked() and self._aspect_ratio > 0:
+            self._updating_spin = True
+            self.w_spin.setValue(max(100, int(value * self._aspect_ratio)))
+            self._updating_spin = False
+
+    def _toggle_lock_aspect(self):
+        self.lock_aspect_cb.setChecked(not self.lock_aspect_cb.isChecked())
+        # Refresh aspect ratio from current values when locking
+        if self.lock_aspect_cb.isChecked():
+            self._aspect_ratio = self.w_spin.value() / max(1, self.h_spin.value())
+        self._sync_aspect_to_overlay()
+
+    def _sync_aspect_to_overlay(self):
+        """Keep overlay's aspect lock state in sync with the checkbox."""
+        self.overlay.lock_aspect = self.lock_aspect_cb.isChecked()
+        self.overlay.aspect_ratio = self._aspect_ratio
 
     def _fit_to_image(self):
         if self.overlay.image:
@@ -676,8 +774,12 @@ class ControlPanel(QWidget):
             w = min(self.overlay.image.width(), screen.width() - 50)
             h = min(self.overlay.image.height(), screen.height() - 50)
             self.overlay.resize(w, h)
+            self._updating_spin = True
             self.w_spin.setValue(w)
             self.h_spin.setValue(h)
+            self._updating_spin = False
+            self._aspect_ratio = w / max(1, h)
+            self._sync_aspect_to_overlay()
 
     def closeEvent(self, event):
         self._save_settings()

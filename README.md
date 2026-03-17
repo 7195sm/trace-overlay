@@ -20,9 +20,10 @@ Think of it as **digital tracing paper** for your monitor.
 
 - **Click-Through Mode** — Mouse clicks pass through the overlay to the app below (Windows API)
 - **Adjustable Opacity** — Slider from 5% to 100%
-- **Rotation & Flip** — Rotate 90° CW/CCW, flip horizontal/vertical
+- **Rotation & Flip** — Precise 0–359° rotation slider, quick ±90° buttons, flip horizontal/vertical
 - **Drag & Drop** — Drop an image file onto the control panel to load it
 - **Resizable Overlay** — Drag edges or set exact pixel dimensions
+- **Aspect Ratio Lock** — Keep proportions when resizing (toggle with checkbox or `Ctrl+L`)
 - **Always on Top** — Overlay stays above all other windows
 - **Remembers Settings** — Window positions, opacity, last image, and transform are saved automatically
 - **Keyboard Shortcuts** — Control everything without leaving your drawing app
@@ -70,11 +71,12 @@ The executable will be in the `dist/` folder.
 | `Ctrl+H` | Hide / show overlay |
 | `Ctrl+[` | Decrease opacity |
 | `Ctrl+]` | Increase opacity |
-| `Ctrl+R` | Rotate clockwise 90° |
-| `Ctrl+Shift+R` | Rotate counter-clockwise 90° |
+| `Ctrl+R` | Rotate clockwise 2° |
+| `Ctrl+Shift+R` | Rotate counter-clockwise 2° |
 | `Ctrl+Shift+H` | Flip horizontal |
 | `Ctrl+Shift+V` | Flip vertical |
 | `Ctrl+F` | Fit overlay to original image size |
+| `Ctrl+L` | Toggle aspect ratio lock |
 
 ## Settings
 
